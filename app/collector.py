@@ -100,11 +100,13 @@ class Collector:
         # We never wait for the previous match to finish once a previously upcoming match starts.
         monitor=await page.context.new_page()
         last_monitor=0.0
-        last_odds_score=None; scoreboard_failures=0
+        last_odds_score=None; scoreboard_failures=0; odds_task=None
         try:
             await monitor.goto(__import__('xbet_config').URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=20000)
         except Exception as exc:
             self.log(f"Фоновый монитор лиги недоступен: {exc}")
+        # new_page() focuses the observer tab; always show the actual game.
+        await page.bring_to_front()
         while not self.stop_event.is_set():
             try: board=await read_scoreboard(page)
             except score_error as exc:
@@ -161,14 +163,15 @@ class Collector:
                 self.runtime.current_match=None
                 await monitor.close()
                 return
-            # Read odds once per score change, not every 0.5 seconds.
+            # Reading Canvas/search may take >5s. It must not block scoreboard
+            # observations or the 06:50 handover.
             if last_odds_score != score:
                 last_odds_score=score
-                try:
-                    await asyncio.wait_for(
-                        self.store_odds(page,mid,score,board.team1,board.team2,read_odds), timeout=5)
-                except TimeoutError:
-                    self.log("Чтение коэффициентов более 5 секунд; возвращаемся к проверке табло.")
+                if odds_task is not None and not odds_task.done():
+                    odds_task.cancel()
+                odds_task=asyncio.create_task(
+                    self._read_odds_background(page,mid,score,board.team1,board.team2,read_odds)
+                )
             for kind,team,confidence,before in tracker.transition(Observation(score,period,board.timer)):
                 if kind=='GOAL':
                     scorer=board.team1 if team==1 else board.team2; self.storage.goal(mid,sum(score),scorer,score_text(before),score_text(score),self.half(period),game_time or None,confidence); self.log(f"Гол команды {scorer}. Счёт {score_text(score)}.")
@@ -214,6 +217,17 @@ class Collector:
                 except Exception as exc:
                     self.log(f"Проверка следующего матча: {type(exc).__name__}: {exc}")
             await self.wait(.5)
+    async def _read_odds_background(self,page,mid,score,t1,t2,reader):
+        try:
+            await asyncio.wait_for(self.store_odds(page,mid,score,t1,t2,reader), timeout=18)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self.storage.odds(mid,score_text(score),None,None,'NOT_FOUND','CANVAS_2D','TIMEOUT_18S')
+            self.log(f"Canvas: коэффициенты не получены за 18 секунд при {score_text(score)}.")
+        except Exception as exc:
+            self.log(f"Ошибка фонового чтения Canvas: {type(exc).__name__}: {exc}")
+
     async def store_odds(self,page,mid,score,t1,t2,reader):
         try:
             self.log(f'Поиск рынка «Следующий гол №{sum(score)+1}» и чтение Canvas 2D.')
@@ -221,14 +235,14 @@ class Collector:
             odds=await reader(page,t1,t2,score[0],score[1],logger=market_log); locked=bool(getattr(odds,'locked_sides',()))
             status='LOCKED' if locked else 'AVAILABLE'
             self.storage.odds(mid,score_text(score),float(odds.team1),float(odds.team2),status,getattr(odds,'source','CANVAS_2D'))
-            if self.runtime.current_match is not None:
+            if self.runtime.current_match is not None and self.runtime.current_match.get('id')==mid and self.runtime.current_match.get('score')==score_text(score):
                 self.runtime.current_match['odds_1']=float(odds.team1); self.runtime.current_match['odds_2']=float(odds.team2)
                 self.runtime.current_match['market_status']=status; self.runtime.current_match['canvas_status']='Активен'
                 self.runtime.current_match['odds_source']=getattr(odds,'source','CANVAS_2D')
             self.log(f'Коэффициенты сохранены: {t1}={odds.team1}; {t2}={odds.team2}.')
         except Exception as exc:
             reason=type(exc).__name__; self.storage.odds(mid,score_text(score),None,None,'NOT_FOUND','CANVAS_2D',reason)
-            if self.runtime.current_match is not None:
+            if self.runtime.current_match is not None and self.runtime.current_match.get('id')==mid and self.runtime.current_match.get('score')==score_text(score):
                 self.runtime.current_match['odds_1']=None; self.runtime.current_match['odds_2']=None
                 self.runtime.current_match['market_status']='NOT_FOUND'; self.runtime.current_match['canvas_status']='Ожидание/нет данных'; self.runtime.current_match['odds_reason']=reason
             self.log(f'Рынок «Следующий гол» не прочитан: {reason}: {exc}')
