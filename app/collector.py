@@ -17,7 +17,7 @@ class Runtime:
 
 class Collector:
     def __init__(self, storage):
-        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None; self.retired_match_ids=set()
+        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None; self.retired_match_ids=set(); self._odds_task=None
     def snapshot(self): return asdict(self.runtime)
     def log(self, text):
         item={"time":datetime.now().strftime("%H:%M:%S"),"message":text}; self.runtime.logs=(self.runtime.logs+[item])[-120:]; print(f"[{item['time']}] {text}")
@@ -53,7 +53,11 @@ class Collector:
                 # Wait for SPA countdown labels instead of reloading the site.
                 matches=[]
                 for attempt in range(4):
-                    matches=await asyncio.wait_for(collect_league_matches(page, self.log if attempt==3 else None), timeout=8)
+                    try:
+                        matches=await asyncio.wait_for(collect_league_matches(page, self.log if attempt==3 else None), timeout=8)
+                    except TimeoutError:
+                        self.log('Тайм-аут сканирования карточек лиги: повторим поиск.')
+                        matches=[]
                     if any(m.get('is_upcoming') for m in matches):
                         break
                     if attempt<3:
@@ -82,7 +86,23 @@ class Collector:
                     self.runtime.stage="Открытие матча"; self.log(f"Открываем: {item['url']}")
                     await page.goto(item['url'],wait_until='domcontentloaded',timeout=30000); self.log("Переход выполнен; ожидаем табло.")
                     await asyncio.wait_for(self.observe(page,item,read_scoreboard,ScoreReadError,read_next_goal_odds,SELECTORS), timeout=540)
-                except Exception as exc: self.runtime.errors+=1; self.log(f"Ошибка перехода/наблюдения: {type(exc).__name__}: {exc}"); await self.wait(2)
+                except Exception as exc:
+                    self.runtime.errors+=1
+                    self.log(f"Ошибка перехода/наблюдения: {type(exc).__name__}: {exc}")
+                    await self.wait(2)
+                finally:
+                    task=self._odds_task
+                    self._odds_task=None
+                    if task is not None and not task.done():
+                        task.cancel()
+                    aux=self.league_page
+                    self.league_page=None
+                    if aux is not None:
+                        try:
+                            await asyncio.wait_for(aux.close(),timeout=3)
+                        except Exception:
+                            pass
+                    self.runtime.current_match=None
         except asyncio.CancelledError: raise
         except Exception as exc: self.runtime.errors+=1; self.runtime.stage="Ошибка жизненного цикла"; self.log(f"Ошибка жизненного цикла: {type(exc).__name__}: {exc}")
         finally:
@@ -99,6 +119,7 @@ class Collector:
         # A separate tab monitors the league while the main tab reads the active scoreboard.
         # We never wait for the previous match to finish once a previously upcoming match starts.
         monitor=await page.context.new_page()
+        self.league_page=monitor
         last_monitor=0.0
         last_odds_score=None; scoreboard_failures=0; odds_task=None; last_odds_attempt=0.0
         try:
@@ -129,11 +150,11 @@ class Collector:
             # the clock. Read them separately: treating the status as a timer
             # caused completed matches to remain in the observer forever.
             try:
-                scoreboard_status=(await page.locator('[data-test="betting-scoreboard-status"]').first.inner_text()).strip()
+                scoreboard_status=(await page.locator('[data-test="betting-scoreboard-status"]').first.inner_text(timeout=1200)).strip()
             except Exception:
                 scoreboard_status=board.period or ''
             try:
-                game_time=(await page.locator('[data-test="betting-scoreboard-status-time"] .ui-game-timer__time .ui-game-timer__label').first.inner_text()).strip()
+                game_time=(await page.locator('[data-test="betting-scoreboard-status-time"] .ui-game-timer__time .ui-game-timer__label').first.inner_text(timeout=1200)).strip()
             except Exception:
                 game_time=board.timer
             score=(board.score.team1,board.score.team2); period,period_reason=determine_match_half(game_time,scoreboard_status)
@@ -180,6 +201,7 @@ class Collector:
                 odds_task=asyncio.create_task(
                     self._read_odds_background(page,mid,score,board.team1,board.team2,read_odds)
                 )
+                self._odds_task=odds_task
             for kind,team,confidence,before in tracker.transition(Observation(score,period,board.timer)):
                 if kind=='GOAL':
                     scorer=board.team1 if team==1 else board.team2; self.storage.goal(mid,sum(score),scorer,score_text(before),score_text(score),self.half(period),game_time or None,confidence); self.log(f"Гол команды {scorer}. Счёт {score_text(score)}.")
