@@ -82,6 +82,8 @@ class Collector:
                     if attempt<3:
                         await self.wait(.4)
                 for candidate in matches:
+                    if candidate.get('match_id') and candidate.get('url'):
+                        self.storage.attach_match_url(candidate['match_id'],candidate['url'])
                     if candidate.get('match_id') and candidate.get('is_upcoming'):
                         self.storage.upsert_match(
                             str(candidate['match_id']), LEAGUE_NAME,
