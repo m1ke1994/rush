@@ -117,7 +117,10 @@ def select_match(matches, excluded_ids=()):
     # A truly unknown card may be the nearest: wait for hydration instead of guessing.
     unknown = [m for m in valid if m.get("status") == "UNKNOWN"]
     upcoming = [(m, parse_time_to_seconds(m.get("game_time"))) for m in valid
-                if m.get("is_upcoming") or m.get("status") == "UPCOMING" or (m.get("status") is None and not m.get("is_live"))]
+                if m.get("is_upcoming") or m.get("status") == "UPCOMING" or (
+                    m.get("status") in (None, "UNKNOWN") and not m.get("is_live")
+                    and m.get("score_1") in (None, 0) and m.get("score_2") in (None, 0)
+                    and not m.get("period"))]
     upcoming = [(m, sec) for m, sec in upcoming if sec is not None]
     if upcoming:
         candidate, seconds = min(upcoming, key=lambda x: x[1])
