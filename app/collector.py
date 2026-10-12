@@ -265,7 +265,10 @@ class Collector:
             raise
         except TimeoutError:
             self.storage.odds(mid,score_text(score),None,None,'NOT_FOUND','CANVAS_2D','TIMEOUT_18S')
-            self.log(f"Canvas: коэффициенты не получены за 18 секунд при {score_text(score)}.")
+            current=self.runtime.current_match
+            if current is not None and current.get('id')==mid and current.get('score')==score_text(score):
+                current.update(market_status='NOT_FOUND',canvas_status='Повторное чтение',odds_reason='TIMEOUT_18S')
+            self.log(f"Canvas: рынок ещё не готов при {score_text(score)}; повторим чтение без остановки наблюдения.")
         except Exception as exc:
             self.log(f"Ошибка фонового чтения Canvas: {type(exc).__name__}: {exc}")
 
