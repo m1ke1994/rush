@@ -1,42 +1,150 @@
+"""Lossless Rush observation export. Never deduplicate fixtures or snapshots."""
 from collections import defaultdict
 from datetime import datetime
 from io import BytesIO
+import json
+import re
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-HEAD=PatternFill('solid',fgColor='19324A')
-def date(value):
-    if not value:return ''
-    try:return datetime.fromisoformat(value).astimezone().strftime('%d.%m.%Y %H:%M:%S')
-    except Exception:return str(value)
-def sheet(book,name,headers,rows):
-    ws=book.create_sheet(name);ws.append(headers)
-    for cell in ws[1]: cell.font=Font(bold=True,color='FFFFFF');cell.fill=HEAD
-    for row in rows: ws.append(row)
-    ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
-    for n in range(1,len(headers)+1): ws.column_dimensions[get_column_letter(n)].width=min(42,max(12,len(headers[n-1])+2))
+HEADER_FILL = PatternFill("solid", fgColor="17354B")
+EXCEL_TEXT_LIMIT = 32767
+INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def clean(value):
+    if value is None or isinstance(value, (int, float, bool, datetime)):
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    value = INVALID_XML_CHARS.sub("", str(value))
+    # Excel has a hard limit, while original observations stay intact in SQLite/CSV.
+    return value[:EXCEL_TEXT_LIMIT]
+
+
+def add_sheet(book, name, headers, rows):
+    ws = book.create_sheet(name)
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(wrap_text=True)
+    for row in rows:
+        ws.append([clean(value) for value in row])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col, title in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = min(44, max(12, len(title) + 3))
     return ws
+
+
+def raw_rows(items, fields):
+    return ([row.get(field) for field in fields] for row in items)
+
+
 def workbook(storage):
-    matches,goals,odds,events=storage.export_bundle(); goals_by=defaultdict(list); odds_by=defaultdict(list)
-    for g in goals:goals_by[g['match_id']].append(g)
-    for o in odds:odds_by[o['match_id']].append(o)
-    book=Workbook();book.remove(book.active)
-    sheet(book,'Матчи',['ID матча','Дата','Время начала','Команда 1','Команда 2','Первый тайм','Второй тайм','Итог','Победитель','Голов 1','Голов 2','Всего','Последовательность команд','Последовательность счёта','Статус','Полнота'],[
-        [m['external_match_id'],date(m['created_at']),date(m['started_at']),m['team_1'],m['team_2'],m['first_half_score'],m['second_half_score'],m['final_score'],m['winner'],*(map(int,(m['final_score'] or '0:0').split(':'))),m['total_goals'],' → '.join(str(g['team'] or '?') for g in goals_by[m['id']]),' → '.join(g['score_after'] for g in goals_by[m['id']]),m['status'],'Полная' if m['data_complete'] else 'Неполная'] for m in matches])
-    sheet(book,'Голы',['ID матча','Дата матча','Команда 1','Команда 2','№','Тайм','Время гола','Кто забил','Счёт до','Счёт после','КФ 1','КФ 2','КФ забившей','КФ другой','Время наблюдения','Достоверность'],[
-        [g['external_match_id'],date(g['started_at']),g['team_1'],g['team_2'],g['goal_number'],g['half'],g['game_time'],g['team'],g['score_before'],g['score_after'],g['team_1_odds'],g['team_2_odds'],g['team_1_odds'] if g['team']==g['team_1'] else g['team_2_odds'],g['team_2_odds'] if g['team']==g['team_1'] else g['team_1_odds'],date(g['detected_at']),g['sequence_confidence']] for g in goals])
-    sheet(book,'Коэффициенты',['ID матча','Дата','Команда 1','Команда 2','Счёт','№ ожидаемого гола','КФ 1','КФ 2','Статус рынка','Время наблюдения'],[[o['external_match_id'],date(o['started_at']),o['team_1'],o['team_2'],o['score'],o['next_goal_number'],o['team_1_odds'],o['team_2_odds'],o['market_status'],date(o['captured_at'])] for o in odds])
-    stats=defaultdict(lambda:defaultdict(int))
-    for m in matches:
-        if not m['data_complete'] or not m['final_score']:continue
-        a,b=map(int,m['final_score'].split(':'))
-        for team,gf,ga in ((m['team_1'],a,b),(m['team_2'],b,a)):
-            s=stats[team];s['matches']+=1;s['gf']+=gf;s['ga']+=ga;s['wins']+=gf>ga;s['draws']+=gf==ga;s['losses']+=gf<ga
-    sheet(book,'Команды',['Команда','Матчей','Побед','Ничьих','Поражений','Забито','Пропущено','Среднее забито'],[[k,v['matches'],v['wins'],v['draws'],v['losses'],v['gf'],v['ga'],round(v['gf']/v['matches'],3)] for k,v in stats.items()])
-    known=defaultdict(int); missed=defaultdict(int)
-    for g in goals:known[g['match_id']]+=1
-    for e in events:
-        if e['event_type']=='MISSED_SCORE_INTERVAL':missed[e['match_id']]+=1
-    sheet(book,'Качество данных',['ID','Дата','Команды','Полнота','Известных голов','Пропусков','Записей коэффициентов','1-й тайм','2-й тайм','Итог'],[[m['external_match_id'],date(m['created_at']),f"{m['team_1']} — {m['team_2']}",'Полная' if m['data_complete'] else 'Неполная',known[m['id']],missed[m['id']],len(odds_by[m['id']]),bool(m['first_half_score']),bool(m['second_half_score']),bool(m['final_score'])] for m in matches])
-    out=BytesIO();book.save(out);return out.getvalue()
+    # All raw database rows: includes LIVE, INTERRUPTED, incomplete and duplicate
+    # fixture names. No pagination, no filtering, no deduplication.
+    matches, goals, odds, events = storage.export_bundle()
+    book = Workbook()
+    book.remove(book.active)
+
+    add_sheet(book, "О выгрузке", ["Параметр", "Значение"], [
+        ["Создано UTC", datetime.utcnow().isoformat() + "Z"],
+        ["Матчей (все статусы)", len(matches)],
+        ["Наблюдений голов", len(goals)],
+        ["Снимков коэффициентов", len(odds)],
+        ["Системных событий", len(events)],
+        ["Источник", "Локальная SQLite база Rush"],
+        ["Принцип", "Каждая исходная запись сохраняется без дедупликации"],
+        ["Ограничение", "Пропущенные события/коэффициенты не восстанавливаются искусственно"],
+        ["Турнирная таблица", "Вычислена только из полных завершённых матчей; не официальная таблица БК"],
+        ["Дата и время", "Все исходные временные метки сохранены строками, как в SQLite"],
+        ["Ограничение Excel", "Текст в одной ячейке ограничен 32767 символами; полная запись сохраняется в SQLite"],
+    ])
+
+    match_columns = [
+        "id", "external_match_id", "league", "team_1", "team_2",
+        "scheduled_at", "started_at", "finished_at", "first_half_score",
+        "second_half_score", "final_score", "winner", "total_goals",
+        "status", "data_complete", "created_at",
+    ]
+    goal_columns = [
+        "id", "match_id", "external_match_id", "started_at",
+        "team_1", "team_2", "goal_number", "half", "game_time",
+        "team", "score_before", "score_after", "team_1_odds",
+        "team_2_odds", "detected_at", "sequence_confidence",
+    ]
+    odd_columns = [
+        "id", "match_id", "external_match_id", "team_1", "team_2",
+        "started_at", "next_goal_number", "score", "team_1_odds",
+        "team_2_odds", "market_status", "unavailable_reason",
+        "captured_at", "source", "signature",
+    ]
+    event_columns = ["id", "match_id", "event_type", "event_data", "detected_at"]
+    add_sheet(book, "Матчи_исходные", match_columns, raw_rows(matches, match_columns))
+    add_sheet(book, "Голы_исходные", goal_columns, raw_rows(goals, goal_columns))
+    add_sheet(book, "КФ_все_снимки", odd_columns, raw_rows(odds, odd_columns))
+    add_sheet(book, "События_все", event_columns, raw_rows(events, event_columns))
+
+    goals_by = defaultdict(list)
+    odds_by = defaultdict(list)
+    events_by = defaultdict(list)
+    for g in goals: goals_by[g["match_id"]].append(g)
+    for o in odds: odds_by[o["match_id"]].append(o)
+    for e in events: events_by[e["match_id"]].append(e)
+
+    def scorer_odds(g):
+        if g.get("team") == g.get("team_1"):
+            return g.get("team_1_odds"), g.get("team_2_odds")
+        if g.get("team") == g.get("team_2"):
+            return g.get("team_2_odds"), g.get("team_1_odds")
+        return None, None
+
+    add_sheet(book, "Голы_для_анализа", [
+        "ID матча", "ID гола", "Дата начала матча", "Команда 1", "Команда 2",
+        "№ гола", "Тайм", "Время гола", "Забила", "Счёт до", "Счёт после",
+        "КФ команды 1 до гола", "КФ команды 2 до гола",
+        "КФ забившей до гола", "КФ соперника до гола", "Достоверность",
+        "Время фиксации UTC",
+    ], (
+        [
+            g.get("external_match_id"), g.get("id"), g.get("started_at"),
+            g.get("team_1"), g.get("team_2"), g.get("goal_number"),
+            g.get("half"), g.get("game_time"), g.get("team"),
+            g.get("score_before"), g.get("score_after"),
+            g.get("team_1_odds"), g.get("team_2_odds"),
+            *scorer_odds(g), g.get("sequence_confidence"), g.get("detected_at"),
+        ] for g in goals
+    ))
+
+    add_sheet(book, "Матчи_для_анализа", [
+        "ID матча", "Начало UTC", "Команда 1", "Команда 2",
+        "1-й тайм", "2-й тайм", "Итог", "Победитель", "Статус",
+        "Полная история", "Голы по порядку", "Счёт по порядку",
+        "Записанных голов", "Снимков КФ", "Событий",
+    ], (
+        [
+            m["external_match_id"], m.get("started_at"), m["team_1"], m["team_2"],
+            m.get("first_half_score"), m.get("second_half_score"),
+            m.get("final_score"), m.get("winner"), m["status"],
+            bool(m.get("data_complete")),
+            " → ".join(str(g.get("team") or "?") for g in goals_by[m["id"]]),
+            " → ".join(str(g.get("score_after") or "?") for g in goals_by[m["id"]]),
+            len(goals_by[m["id"]]), len(odds_by[m["id"]]), len(events_by[m["id"]]),
+        ] for m in matches
+    ))
+
+    standings = storage.calculated_standings()
+    standings_columns = [
+        "position", "team", "played", "wins", "draws", "losses",
+        "goals_for", "goals_against", "goal_difference", "points",
+    ]
+    add_sheet(book, "Таблица_расчётная", standings_columns,
+              raw_rows(standings["table"], standings_columns))
+
+    out = BytesIO()
+    book.save(out)
+    return out.getvalue()
