@@ -76,7 +76,7 @@ class Collector:
     async def observe(self,page,item,read_scoreboard,score_error,read_odds,selectors):
         external=str(item.get('match_id') or item.get('href') or page.url)
         mid=self.storage.upsert_match(external,LEAGUE_NAME,item.get('team_1') or 'Не определено',item.get('team_2') or 'Не определено','LIVE' if item.get('is_live') else 'UPCOMING',item.get('game_time'))
-        tracker=None; first_half=None; self.runtime.stage="Ожидание начала матча"
+        tracker=None; first_half=None; last_first_half_score=None; self.runtime.stage="Ожидание начала матча"
         # A separate tab monitors the league while the main tab reads the active scoreboard.
         # We never wait for the previous match to finish once a previously upcoming match starts.
         monitor=await page.context.new_page()
@@ -117,6 +117,12 @@ class Collector:
                     scorer=board.team1 if team==1 else board.team2; self.storage.goal(mid,sum(score),scorer,score_text(before),score_text(score),self.half(period),game_time or None,confidence); self.log(f"Гол команды {scorer}. Счёт {score_text(score)}.")
                 else:
                     self.storage.event(mid,'MISSED_SCORE_INTERVAL' if kind=='GAP' else kind,{'before':score_text(before),'after':score_text(score),'period':period}); self.storage.set_match(mid,data_complete=0); self.log(f"Недостоверный переход {score_text(before)} → {score_text(score)} сохранён.")
+            if period=='1':
+                last_first_half_score=score
+            elif period=='2' and first_half is None and last_first_half_score is not None:
+                first_half=last_first_half_score
+                self.storage.set_match(mid,first_half_score=score_text(first_half))
+                self.log(f"Первый тайм зафиксирован при переходе ко второму: {score_text(first_half)}.")
             low=period.lower()
             if first_half is None and any(x in low for x in ('перерыв','half time','тайм заверш')):
                 first_half=score; self.storage.set_match(mid,first_half_score=score_text(score)); self.log(f"Первый тайм завершён: {score_text(score)}.")
