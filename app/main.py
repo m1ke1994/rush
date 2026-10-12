@@ -31,6 +31,20 @@ async def start():
 async def stop():
     await collector.stop()
     return {"stopped": True, "message": "Наблюдение остановлено"}
+@app.post("/api/observations/clear")
+async def clear_observations(confirm: str = ""):
+    if confirm != "DELETE_ALL_OBSERVATIONS":
+        raise HTTPException(400, "Требуется явное подтверждение удаления")
+    if collector.runtime.running or (collector.task and not collector.task.done()):
+        raise HTTPException(409, "Сначала остановите наблюдение")
+    counts=storage.clear_observations()
+    collector.retired_match_ids.clear()
+    collector.upcoming_ids.clear()
+    collector.pending_next_id=None
+    collector.runtime.current_match=None
+    collector.log("История наблюдений очищена пользователем.")
+    return {"cleared": True, "deleted": counts}
+
 @app.get("/api/standings")
 def standings(): return storage.calculated_standings()
 @app.get("/api/matches")
