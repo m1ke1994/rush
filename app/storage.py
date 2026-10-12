@@ -189,6 +189,16 @@ class Storage:
                 con.execute(f"DELETE FROM {table}")
             return counts
 
+    def attach_match_url(self, external_id, url):
+        """Add a known canonical URL without changing the match status."""
+        if not url: return
+        with self.connection() as con:
+            con.execute("UPDATE matches SET match_url=? WHERE external_match_id=?", (url,str(external_id)))
+
+    def all_events(self):
+        with self.connection() as con:
+            return [dict(r) for r in con.execute("SELECT * FROM match_events ORDER BY match_id,id")]
+
     def pending_final_results(self, limit=100):
         """Matches observed live but without a verified final score."""
         with self.connection() as con:
