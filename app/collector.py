@@ -8,6 +8,7 @@ from .config import ROOT, LEAGUE_NAME
 from .goal_tracker import GoalTracker, Observation, score_text
 from .league_parser import collect_league_matches, select_match, parse_time_to_seconds
 from .periods import determine_match_half
+from .final_results import FinalResultReconciler
 
 @dataclass
 class Runtime:
@@ -17,7 +18,7 @@ class Runtime:
 
 class Collector:
     def __init__(self, storage):
-        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None; self.retired_match_ids=set(); self._odds_task=None
+        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None; self.retired_match_ids=set(); self._odds_task=None; self.finalizer_task=None
     def snapshot(self): return asdict(self.runtime)
     def log(self, text):
         item={"time":datetime.now().strftime("%H:%M:%S"),"message":text}; self.runtime.logs=(self.runtime.logs+[item])[-120:]; print(f"[{item['time']}] {text}")
@@ -47,6 +48,12 @@ class Collector:
                 result=await authorize(page,self.stop_event)
                 if result.get('status')=='AUTHORIZED': self.runtime.auth="Авторизация подтверждена"; self.log("Авторизация подтверждена."); break
                 self.runtime.auth="Требуется ручная авторизация"; self.runtime.stage="Ожидание ручной авторизации"; self.log("Маркер RUB не найден; ожидаю ручной вход."); await self.wait(2)
+            finalizer=FinalResultReconciler(
+                self.storage,self.manager,self.log,self.stop_event,
+                lambda: (self.runtime.current_match or {}).get("id"),
+                league_url=URL_CONFIG.next_goal_league_url,
+                selectors=SELECTORS,scoreboard_reader=read_scoreboard)
+            self.finalizer_task=asyncio.create_task(finalizer.run())
             while not self.stop_event.is_set():
                 self.runtime.stage="Поиск ближайшего матча"; self.runtime.league="Переход в FC 26. 5x5 Rush"
                 try:
@@ -80,7 +87,7 @@ class Collector:
                             str(candidate['match_id']), LEAGUE_NAME,
                             candidate.get('team_1') or 'Не определено',
                             candidate.get('team_2') or 'Не определено',
-                            'UPCOMING', candidate.get('game_time'))
+                            'UPCOMING', candidate.get('game_time'),candidate.get('url'))
                 self.log(f"Сканирование: {len(matches)} карточек; "
                          f"{sum(bool(m.get('is_upcoming')) for m in matches)} с обратным отсчётом.")
                 target=self.pending_next_id
@@ -118,6 +125,11 @@ class Collector:
         except asyncio.CancelledError: raise
         except Exception as exc: self.runtime.errors+=1; self.runtime.stage="Ошибка жизненного цикла"; self.log(f"Ошибка жизненного цикла: {type(exc).__name__}: {exc}")
         finally:
+            if self.finalizer_task is not None:
+                self.finalizer_task.cancel()
+                try: await asyncio.wait_for(self.finalizer_task,timeout=4)
+                except (asyncio.CancelledError,TimeoutError): pass
+                self.finalizer_task=None
             if self.manager:
                 try: await self.manager.stop()
                 except Exception: pass
@@ -126,7 +138,7 @@ class Collector:
             self.log("Наблюдение остановлено.")
     async def observe(self,page,item,read_scoreboard,score_error,read_odds,selectors):
         external=str(item.get('match_id') or item.get('href') or page.url)
-        mid=self.storage.upsert_match(external,LEAGUE_NAME,item.get('team_1') or 'Не определено',item.get('team_2') or 'Не определено','LIVE' if item.get('is_live') else 'UPCOMING',item.get('game_time'))
+        mid=self.storage.upsert_match(external,LEAGUE_NAME,item.get('team_1') or 'Не определено',item.get('team_2') or 'Не определено','LIVE' if item.get('is_live') else 'UPCOMING',item.get('game_time'),item.get('url'))
         tracker=None; first_half=None; last_first_half_score=None; self.runtime.stage="Ожидание начала матча"
         # A separate tab monitors the league while the main tab reads the active scoreboard.
         # We never wait for the previous match to finish once a previously upcoming match starts.
