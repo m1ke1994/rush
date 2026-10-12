@@ -1,0 +1,223 @@
+import asyncio
+from copy import deepcopy
+from datetime import datetime, timezone
+from typing import Any
+
+from .config import CONFIG
+from .budget import DEMO_START_BUDGET
+from .strategy import DEFAULT_STRATEGY_CONFIG
+from .models import DemoStatus
+from backend.app.long_series import default_long_series_runtime
+from backend.app.team1_profile import default_team1_profile_runtime
+from backend.app.favorite_shadow import default_favorite_shadow_runtime
+
+
+STRATEGY_PRESENTATION = {
+    "NEXT_GOAL": ("Следующий гол", "Следующий гол", None),
+    "FIRST_HALF_DRAW": ("Ничья — 1-й тайм", "1X2. 1-й тайм", "Ничья"),
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def initial_state() -> dict[str, Any]:
+    return {
+        "running": False,
+        "browser": {"status": "CLOSED", "context": "CLOSED", "page": "CLOSED"},
+        "auth": {"status": "UNKNOWN"},
+        "mode": "DEMO",
+        "strategy_type": "NEXT_GOAL",
+        "strategy_name": "Следующий гол",
+        "market_name": "Следующий гол",
+        "market_selection": None,
+        "market_odds": None,
+        "score": None,
+        "total_goals": None,
+        "total_parity": None,
+        "market_available": False,
+        "market_locked": False,
+        "odds_available": False,
+        "odds_value": None,
+        "time_waiting_for_market": 0.0,
+        "status": DemoStatus.STOPPED.value,
+        "league": CONFIG.league_name,
+        "message": "Демо остановлено",
+        "error": None,
+        "event": None,
+        "match": None,
+        "scanner": {"total": 0, "started": 0, "upcoming": 0, "selected": None},
+        "selected_team": None,
+        "selected_side": None,
+        "initial_selected_odds": None,
+        "other_team": None,
+        "selection_reason": None,
+        "odds": {
+            "selected": None,
+            "opponent": None,
+            "team1": None,
+            "team2": None,
+            "source": None,
+            "confidence": None,
+            "backend": None,
+            "status": "WAITING",
+        },
+        "ocr": {
+            "status": "NOT_USED_FOR_NEXT_GOAL",
+            "attempt": 0,
+            "max_attempts": CONFIG.ocr_max_attempts,
+            "canvas": None,
+            "engine": None,
+            "latency_seconds": None,
+            "candidates": [],
+            "market_bbox": None,
+        },
+        "market_reader": {
+            "source": "CANVAS 2D / fillText + DOM fallback",
+            "status": "WAITING",
+            "attempt": 0,
+            "next_goal_number": None,
+        },
+        "coupon_recovery": {
+            "phase": "IDLE",
+            "attempt_id": None,
+            "step": None,
+            "amount": None,
+            "selected_team": None,
+            "score_before": None,
+            "score_after": None,
+            "cleanup_cycle": 0,
+            "same_match": True,
+            "same_team": True,
+            "same_step": True,
+            "message": None,
+        },
+        "bet": {
+            "step": 0,
+            "max_steps": DEFAULT_STRATEGY_CONFIG.max_steps,
+            "amount": None,
+            "market": "Следующий гол",
+            "odds": None,
+            "score_before": None,
+            "next_goal_number": None,
+        },
+        "budget": {
+            "initial_budget": float(DEMO_START_BUDGET),
+            "current_budget": float(DEMO_START_BUDGET),
+            "session_profit": 0,
+        },
+        "strategy_config": DEFAULT_STRATEGY_CONFIG.to_dict(),
+        "run_time": {
+            "enabled": DEFAULT_STRATEGY_CONFIG.run_time_limit_enabled,
+            "duration_hours": DEFAULT_STRATEGY_CONFIG.run_duration_hours,
+            "started_at": None,
+            "deadline_at": None,
+            "limit_reached": False,
+            "awaiting_active_bet": False,
+            "stopped_by_limit": False,
+        },
+        "long_series": default_long_series_runtime(),
+        "team1_profile": default_team1_profile_runtime(),
+        "favorite_shadow": default_favorite_shadow_runtime(),
+        "sequence": {
+            "current_step": 1,
+            "status": "WAITING_FOR_MATCH",
+            "cumulative_pnl": 0,
+            "cumulative_losses": 0,
+        },
+        "last_change": None,
+        "last_result": None,
+        "stats": {
+            "matches_processed": 0,
+            "bets": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_amount": 0,
+            "average_odds": None,
+            "max_step": 0,
+            "average_steps_to_win": None,
+        },
+        "updated_at": utc_now(),
+    }
+
+
+class DemoStateStore:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._state = initial_state()
+
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            return deepcopy(self._state)
+
+    async def reset_for_start(self, stats: dict[str, Any]) -> None:
+        async with self._lock:
+            self._state = initial_state()
+            self._state.update(
+                running=True,
+                status=DemoStatus.OPENING_LEAGUE.value,
+                message="Запуск DEMO worker",
+                stats=deepcopy(stats),
+                updated_at=utc_now(),
+            )
+
+    async def reset_after_database_clear(
+        self,
+        *,
+        browser: dict[str, Any],
+        budget: dict[str, Any],
+        strategy_config: dict[str, Any],
+        sequence: dict[str, Any],
+        stats: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            self._state = initial_state()
+            self._state.update(
+                browser=deepcopy(browser),
+                budget=deepcopy(budget),
+                strategy_config=deepcopy(strategy_config),
+                run_time={
+                    "enabled": bool(strategy_config.get("run_time_limit_enabled", False)),
+                    "duration_hours": int(strategy_config.get("run_duration_hours", 3)),
+                    "started_at": None,
+                    "deadline_at": None,
+                    "limit_reached": False,
+                    "awaiting_active_bet": False,
+                    "stopped_by_limit": False,
+                },
+                sequence=deepcopy(sequence),
+                stats=deepcopy(stats),
+                status=DemoStatus.STOPPED.value,
+                message="База данных очищена",
+                event="DATABASE_CLEARED",
+                updated_at=utc_now(),
+            )
+
+    async def restore(self, *, budget: dict[str, Any], strategy_config: dict[str, Any], sequence: dict[str, Any], stats: dict[str, Any]) -> None:
+        async with self._lock:
+            strategy_type = strategy_config.get("strategy_type", "NEXT_GOAL")
+            strategy_name, market_name, market_selection = STRATEGY_PRESENTATION.get(
+                strategy_type, STRATEGY_PRESENTATION["NEXT_GOAL"]
+            )
+            self._state.update(
+                budget=deepcopy(budget),
+                strategy_config=deepcopy(strategy_config),
+                sequence=deepcopy(sequence),
+                stats=deepcopy(stats),
+                strategy_type=strategy_type,
+                strategy_name=strategy_name,
+                market_name=market_name,
+                market_selection=market_selection,
+                bet={**self._state["bet"], "step": int(sequence["current_step"]), "max_steps": strategy_config["max_steps"], "amount": strategy_config["stakes"][int(sequence["current_step"]) - 1] if int(sequence["current_step"]) <= strategy_config["max_steps"] else None},
+                updated_at=utc_now(),
+            )
+
+    async def update(self, **changes: Any) -> dict[str, Any]:
+        async with self._lock:
+            self._state.update(deepcopy(changes))
+            self._state["updated_at"] = utc_now()
+            return deepcopy(self._state)
+
+
+STATE = DemoStateStore()

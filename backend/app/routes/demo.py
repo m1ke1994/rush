@@ -1,0 +1,101 @@
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query
+
+from backend.app.demo.budget_sync import sync_strategy_budget
+from backend.app.demo.engine import (
+    BrowserStartError,
+    DatabaseClearBlockedError,
+    ENGINE,
+    HistoryClearBlockedError,
+    ModeConflictError,
+)
+from backend.app.demo.history import REPOSITORY
+from backend.app.demo.state import STATE
+from backend.app.session_control import stop_and_reset_session
+
+
+router = APIRouter(prefix="/api/demo", tags=["demo"])
+
+
+@router.post("/start")
+async def start_demo():
+    try:
+        return await ENGINE.start()
+    except BrowserStartError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    except ModeConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/stop")
+async def stop_demo():
+    try:
+        return await stop_and_reset_session("DEMO")
+    except ModeConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/reset")
+async def reset_demo_sequence():
+    return await ENGINE.reset_sequence()
+
+
+@router.get("/strategy-config")
+async def get_strategy_config():
+    return await REPOSITORY.get_config()
+
+
+@router.put("/strategy-config")
+async def save_strategy_config(payload: dict[str, Any]):
+    try:
+        saved = await ENGINE.save_strategy_config(payload)
+        await sync_strategy_budget()
+        return saved
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/budget")
+async def demo_budget():
+    return await REPOSITORY.get_budget()
+
+
+@router.get("/state")
+async def demo_state():
+    return await STATE.snapshot()
+
+
+@router.get("/history")
+async def demo_history(limit: int = Query(default=500, ge=1, le=5000)):
+    return {"items": await REPOSITORY.history(limit, mode="DEMO")}
+
+
+@router.delete("/history")
+async def clear_demo_history():
+    try:
+        return await ENGINE.clear_history()
+    except HistoryClearBlockedError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+
+
+@router.delete("/database")
+async def clear_demo_database():
+    try:
+        return await ENGINE.clear_database()
+    except DatabaseClearBlockedError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+
+
+@router.get("/logs")
+async def demo_logs(limit: int = Query(default=500, ge=1, le=5000)):
+    return {"items": await REPOSITORY.logs(limit)}

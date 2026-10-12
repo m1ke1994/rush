@@ -1,0 +1,649 @@
+import asyncio
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from playwright.async_api import Locator, Page
+
+from auth import authorize
+from backend.app.browser.navigation import goto_with_retry
+from xbet_config import RUNTIME_CONFIG, SELECTORS, URL_CONFIG, build_match_url
+
+
+# ============================================================
+# ENV / CONFIG
+# ============================================================
+
+MATCHES_URL = URL_CONFIG.next_goal_league_url
+LEAGUE_NAME = RUNTIME_CONFIG.league_name
+MONITOR_INTERVAL = RUNTIME_CONFIG.match_monitor_interval
+
+BASE_DIR = Path(__file__).resolve().parent
+
+front_file_env = RUNTIME_CONFIG.matches_front_file
+
+FRONT_FILE = Path(front_file_env)
+if not FRONT_FILE.is_absolute():
+    FRONT_FILE = BASE_DIR / FRONT_FILE
+
+
+# ============================================================
+# SELECTORS
+# ============================================================
+
+MATCH_SELECTOR = SELECTORS.game_card
+TEAM_SELECTOR = SELECTORS.team_name
+TIME_SELECTOR = SELECTORS.match_time
+PERIOD_SELECTOR = SELECTORS.match_period
+MARKET_SELECTOR = SELECTORS.match_market
+MARKET_NAME_SELECTOR = SELECTORS.market_name
+MARKET_VALUE_SELECTOR = SELECTORS.market_value
+MATCH_LINK_SELECTOR = SELECTORS.match_link
+SCORE_SELECTOR = SELECTORS.score
+
+LEAGUE_PATH = urlparse(MATCHES_URL).path.rstrip("/")
+LEAGUE_MATCH_HREF_FRAGMENT = f"{LEAGUE_PATH}/"
+LEAGUE_MATCH_LINK_SELECTOR = (
+    f'{MATCH_LINK_SELECTOR}[href*="{LEAGUE_MATCH_HREF_FRAGMENT}"]'
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def log(message: str):
+    print(f"[THIS_MATCH] {message}")
+
+
+def clean_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.strip().split())
+
+
+async def safe_text(locator, default=""):
+    try:
+        if await locator.count() == 0:
+            return default
+        text = await locator.first.inner_text()
+        return clean_text(text)
+    except Exception:
+        return default
+
+
+def time_to_seconds(value: str | None):
+    """
+    Время на карточке будущего матча:
+        01:28 -> 88 сек.
+        14:57 -> 897 сек.
+        34:56 -> 2096 сек.
+    """
+    value = clean_text(value)
+    if not value:
+        return None
+
+    parts = value.split(":")
+    if len(parts) != 2:
+        return None
+
+    try:
+        minutes = int(parts[0])
+        seconds = int(parts[1])
+    except ValueError:
+        return None
+
+    if minutes < 0 or seconds < 0 or seconds >= 60:
+        return None
+
+    return minutes * 60 + seconds
+
+
+def is_upcoming_match(
+    *,
+    period: str | None,
+    finished: bool,
+    time_seconds: int | None,
+) -> bool:
+    """Pure rule used by both the scanner and unit tests."""
+    return not finished and not clean_text(period) and time_seconds is not None
+
+
+def sort_upcoming_matches(matches):
+    return sorted(
+        (item for item in matches if item.get("is_upcoming")),
+        key=lambda item: item["time_seconds"],
+    )
+
+
+def is_league_match_href(href: str | None) -> bool:
+    return bool(href and LEAGUE_MATCH_HREF_FRAGMENT in href)
+
+
+def league_match_links(scope: Page | Locator) -> Locator:
+    return scope.locator(LEAGUE_MATCH_LINK_SELECTOR)
+
+
+def match_card_for_link(link: Locator) -> Locator:
+    return link.locator(SELECTORS.match_card_ancestor_xpath).first
+
+
+def exact_match_link_selector(href: str) -> str:
+    return f"{MATCH_LINK_SELECTOR}[href={json.dumps(href)}]"
+
+
+# ============================================================
+# OPEN / CHECK LEAGUE
+# ============================================================
+
+async def open_matches_page(page: Page):
+    print()
+    print("=" * 70)
+    print("ПЕРЕХОД В LIVE-ЛИГУ")
+    print("=" * 70)
+    print()
+
+    log(f"Открываем: {MATCHES_URL}")
+
+    await goto_with_retry(
+        page,
+        MATCHES_URL,
+        timeout_ms=60_000,
+        attempts=2,
+        logger=log,
+    )
+
+    # Do not pay an unconditional 3-second delay. find_league_container() and
+    # the scanner below wait for the exact DOM elements they need.
+    log("DOM страницы загружен.")
+    log(f"Текущий URL: {page.url}")
+
+
+async def find_league_container(page: Page):
+    current_path = urlparse(page.url).path.rstrip("/")
+    if current_path != LEAGUE_PATH:
+        log(f"Открыт другой путь: {current_path or '/'}")
+        return None
+
+    container = page.locator(SELECTORS.page_body)
+    await container.wait_for(state="attached", timeout=10_000)
+    return container
+
+
+async def check_correct_page(page: Page):
+    container = await find_league_container(page)
+
+    if container is None:
+        raise RuntimeError(f"Лига '{LEAGUE_NAME}' не найдена.")
+
+    log("Подтверждено: мы находимся там, где нужно.")
+    return True
+
+
+# ============================================================
+# MATCH DATA
+# ============================================================
+
+async def get_score(game):
+    try:
+        values = game.locator(SCORE_SELECTOR)
+        if await values.count() < 2:
+            return None
+
+        score1 = clean_text(await values.nth(0).inner_text())
+        score2 = clean_text(await values.nth(1).inner_text())
+        return f"{score1}:{score2}"
+    except Exception:
+        return None
+
+
+async def get_market_value(game, wanted_market: str):
+    markets = game.locator(MARKET_SELECTOR)
+    count = await markets.count()
+
+    for index in range(count):
+        market = markets.nth(index)
+
+        try:
+            label = await safe_text(market.locator(MARKET_NAME_SELECTOR))
+            if not label:
+                continue
+
+            label = clean_text(label)
+            if label.casefold() != wanted_market.casefold():
+                continue
+
+            value = await safe_text(
+                market.locator(MARKET_VALUE_SELECTOR)
+            )
+
+            if not value or value == "-":
+                return None
+
+            return value
+        except Exception:
+            continue
+
+    return None
+
+
+async def get_match_href(game):
+    try:
+        return await game.locator(
+            MATCH_LINK_SELECTOR
+        ).first.get_attribute("href")
+    except Exception:
+        return None
+
+
+def get_match_id(href: str | None):
+    if not href:
+        return None
+
+    result = re.search(
+        r"/(\d+)(?:-[^/?#]+)?(?:[?#].*)?$",
+        href,
+    )
+    return result.group(1) if result else None
+
+
+async def parse_match(game, number: int):
+    teams = game.locator(TEAM_SELECTOR)
+    if await teams.count() < 2:
+        return None
+
+    team1 = clean_text(await teams.nth(0).inner_text())
+    team2 = clean_text(await teams.nth(1).inner_text())
+
+    time_value = await safe_text(game.locator(TIME_SELECTOR))
+    time_seconds = time_to_seconds(time_value)
+
+    period = await safe_text(game.locator(PERIOD_SELECTOR))
+    period_lower = period.lower()
+
+    finished = any(
+        marker in period_lower
+        for marker in (
+            "заверш",
+            "окончен",
+            "finished",
+            "full time",
+        )
+    )
+
+    # По текущему DOM будущие матчи имеют countdown MM:SS,
+    # но не имеют текста периода (1-й тайм / 2-й тайм / завершена).
+    is_upcoming = is_upcoming_match(
+        period=period,
+        finished=finished,
+        time_seconds=time_seconds,
+    )
+
+    odds_team1 = await get_market_value(game, "П1")
+    odds_draw = await get_market_value(game, "Ничья")
+    odds_team2 = await get_market_value(game, "П2")
+
+    score = await get_score(game) or "0:0"
+    href = await get_match_href(game)
+    match_id = get_match_id(href)
+
+    match_url = build_match_url(href) if href else None
+
+    print(f"[MATCH] {team1} — {team2}")
+    print(f"[MATCH] URL: {match_url or '<не найден>'}")
+
+    return {
+        "number": number,
+        "match_id": match_id,
+        "team1": team1,
+        "team2": team2,
+        "time": time_value,
+        "time_seconds": time_seconds,
+        "period": period,
+        "is_upcoming": is_upcoming,
+        "score": score,
+        "odds_team1": odds_team1,
+        "odds_draw": odds_draw,
+        "odds_team2": odds_team2,
+        "finished": finished,
+        "href": href,
+        "url": match_url,
+    }
+
+
+# ============================================================
+# UPCOMING MATCHES
+# ============================================================
+
+async def get_upcoming_matches(page: Page):
+    league_container = await find_league_container(page)
+
+    if league_container is None:
+        raise RuntimeError("Контейнер нужной лиги не найден.")
+
+    links = league_match_links(league_container)
+    count = await links.count()
+    print(f"[SELECTOR] Найдено матчей: {count}")
+
+    upcoming = []
+
+    for index in range(count):
+        game = match_card_for_link(links.nth(index))
+
+        try:
+            match = await parse_match(game, index + 1)
+        except Exception as error:
+            log(f"Ошибка чтения матча #{index + 1}: {error}")
+            continue
+
+        if not match:
+            continue
+
+        if not match["is_upcoming"]:
+            continue
+
+        upcoming.append(match)
+
+    # Чем меньше countdown, тем раньше матч начнётся.
+    upcoming = sort_upcoming_matches(upcoming)
+
+    # После сортировки номера на фронте должны быть 1,2,3...
+    for number, match in enumerate(upcoming, start=1):
+        match["number"] = number
+
+    return upcoming
+
+
+# ============================================================
+# FRONTEND JSON
+# ============================================================
+
+def create_front_data(matches):
+    return {
+        "ok": True,
+        "league": LEAGUE_NAME,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "matches_count": len(matches),
+        "next_match": matches[0] if matches else None,
+        "matches": matches,
+    }
+
+
+async def write_front(matches):
+    FRONT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    data = create_front_data(matches)
+    temp_file = Path(str(FRONT_FILE) + ".tmp")
+
+    with open(temp_file, "w", encoding="utf-8") as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(temp_file, FRONT_FILE)
+    return data
+
+
+def create_snapshot(matches):
+    return json.dumps(
+        matches,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def print_upcoming_matches(matches):
+    print()
+    print("=" * 70)
+    print(f"ГРЯДУЩИХ МАТЧЕЙ: {len(matches)}")
+    print("=" * 70)
+    print()
+
+    for match in matches:
+        print(f"[МАТЧ {match['number']}] {match['team1']} — {match['team2']}")
+        print(f"    До начала: {match['time']}")
+        print(f"    КФ {match['team1']}: {match['odds_team1']}")
+        print(f"    Ничья: {match['odds_draw']}")
+        print(f"    КФ {match['team2']}: {match['odds_team2']}")
+        print(f"    ID: {match['match_id']}")
+        print(f"    URL: {match['url']}")
+        print()
+
+    print(f"[FRONT] JSON: {FRONT_FILE}")
+    print("=" * 70)
+    print()
+
+
+# ============================================================
+# OPEN NEAREST MATCH
+# ============================================================
+
+async def open_nearest_match(page: Page, matches):
+    if not matches:
+        return None
+
+    nearest = matches[0]
+
+    print()
+    print("=" * 70)
+    print("БЛИЖАЙШИЙ МАТЧ")
+    print("=" * 70)
+    print(f"{nearest['team1']} — {nearest['team2']}")
+    print(f"До начала: {nearest['time']}")
+    print(f"П1: {nearest['odds_team1']}")
+    print(f"X: {nearest['odds_draw']}")
+    print(f"П2: {nearest['odds_team2']}")
+    print(f"href: {nearest['href']}")
+    print("=" * 70)
+    print()
+
+    href = nearest.get("href")
+    if not href:
+        raise RuntimeError("У ближайшего матча не найдена ссылка href.")
+
+    # Ищем именно ссылку выбранного матча, а не первую ссылку на странице.
+    link = page.locator(exact_match_link_selector(href)).first
+
+    await link.wait_for(
+        state="visible",
+        timeout=10_000,
+    )
+
+    log("Ссылка ближайшего матча найдена в DOM.")
+    log("Кликаем по ближайшему матчу...")
+
+    await link.click()
+
+    # Для SPA достаточно дождаться смены URL / отрисовки.
+    try:
+        if nearest.get("match_id"):
+            await page.wait_for_url(
+                re.compile(
+                    rf".*/{re.escape(nearest['match_id'])}-[^/?#]+.*"
+                ),
+                timeout=15_000,
+            )
+        else:
+            await page.wait_for_timeout(2500)
+    except Exception:
+        await page.wait_for_timeout(2500)
+
+    selected_url = nearest.get("url")
+    selected_path = urlparse(selected_url).path if selected_url else ""
+    current_path = urlparse(page.url).path
+
+    if selected_path and current_path.rstrip("/") != selected_path.rstrip("/"):
+        raise RuntimeError(
+            "После клика URL не соответствует выбранному матчу: "
+            f"ожидался {selected_url}, открыт {page.url}"
+        )
+
+    print()
+    print("=" * 70)
+    print("ПЕРЕШЛИ В БЛИЖАЙШИЙ МАТЧ")
+    print("=" * 70)
+    print(f"{nearest['team1']} — {nearest['team2']}")
+    print(f"URL: {page.url}")
+    print("=" * 70)
+    print()
+
+    return nearest
+
+
+# ============================================================
+# MONITOR UPCOMING UNTIL WE CAN SELECT ONE
+# ============================================================
+
+async def monitor_upcoming_matches(page: Page):
+    print()
+    print("=" * 70)
+    print("МОНИТОРИНГ ГРЯДУЩИХ МАТЧЕЙ ЗАПУЩЕН")
+    print("=" * 70)
+    print(f"Лига: {LEAGUE_NAME}")
+    print(f"Интервал: {MONITOR_INTERVAL} сек.")
+    print(f"FRONT: {FRONT_FILE}")
+    print("=" * 70)
+    print()
+
+    previous_snapshot = None
+
+    while True:
+        if page.is_closed():
+            raise RuntimeError("Страница браузера закрыта.")
+
+        try:
+            upcoming_matches = await get_upcoming_matches(page)
+
+            # Сначала ВСЕ будущие матчи записываем фронту.
+            await write_front(upcoming_matches)
+
+            current_snapshot = create_snapshot(upcoming_matches)
+
+            if current_snapshot != previous_snapshot:
+                print_upcoming_matches(upcoming_matches)
+                previous_snapshot = current_snapshot
+            else:
+                log(
+                    "Грядущие матчи проверены. "
+                    f"Изменений нет. Матчей: {len(upcoming_matches)}"
+                )
+
+            # После записи на фронт выбираем матч с минимальным countdown.
+            if upcoming_matches:
+                return await open_nearest_match(
+                    page,
+                    upcoming_matches,
+                )
+
+            log("Грядущих матчей пока нет. Ждём...")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log(f"Ошибка мониторинга: {error}")
+
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+
+# ============================================================
+# THIS MATCH
+# ============================================================
+
+async def this_match(page: Page):
+    # 1. Открываем страницу лиги.
+    await open_matches_page(page)
+
+    # 2. Проверяем по заголовку, что мы точно в нужной лиге.
+    await check_correct_page(page)
+
+    # 3. Получаем будущие матчи, передаём их фронту,
+    #    сортируем по countdown и кликаем ближайший.
+    selected_match = await monitor_upcoming_matches(page)
+
+    return selected_match
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    print()
+    print("=" * 70)
+    print("THIS_MATCH")
+    print("=" * 70)
+    print()
+
+    from backend.app.browser.manager import BROWSER_MANAGER
+
+    page = await BROWSER_MANAGER.start()
+    try:
+            print()
+            print("=" * 70)
+            print("ШАГ 1 — АВТОРИЗАЦИЯ")
+            print("=" * 70)
+            print()
+
+            auth_result = await authorize(page)
+            log(f"AUTH RESULT: {auth_result}")
+
+            if not auth_result.get("ok"):
+                raise RuntimeError(
+                    "Авторизация не выполнена. Работа остановлена."
+                )
+
+            print()
+            print("=" * 70)
+            if auth_result.get("status") == "AUTHORIZED":
+                print("АВТОРИЗАЦИЯ ПОДТВЕРЖДЕНА")
+            else:
+                print("ТАЙМАУТ АВТОРИЗАЦИИ — ПРОДОЛЖАЕМ РАБОТУ")
+            print("=" * 70)
+            print()
+
+            print()
+            print("=" * 70)
+            print("ШАГ 2 — ПОИСК БЛИЖАЙШЕГО МАТЧА")
+            print("=" * 70)
+            print()
+
+            selected_match = await this_match(page)
+
+            print()
+            log(f"SELECTED MATCH: {selected_match}")
+
+            # На следующем этапе здесь продолжим работу уже
+            # внутри открытого матча.
+            print()
+            print("Браузер оставлен открытым для следующего этапа.")
+            print("Нажми ENTER для завершения.")
+            await asyncio.to_thread(input)
+
+    except KeyboardInterrupt:
+            print()
+            print("[SYSTEM] Остановка пользователем.")
+
+    except Exception as error:
+            print()
+            print("=" * 70)
+            print("ОШИБКА THIS_MATCH")
+            print("=" * 70)
+            print(error)
+            print("=" * 70)
+            print()
+            print("Браузер оставлен открытым для диагностики.")
+            await asyncio.to_thread(input)
+
+    finally:
+        # Standalone script termination is an explicit application shutdown.
+        await BROWSER_MANAGER.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

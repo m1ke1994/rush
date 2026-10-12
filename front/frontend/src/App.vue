@@ -1,0 +1,2383 @@
+<script setup>
+
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+
+import { apiUrl } from './config'
+
+const emptyStats = {
+
+  matches_processed: 0,
+
+  bets: 0,
+
+  wins: 0,
+
+  losses: 0,
+
+  total_amount: 0,
+
+  average_odds: null,
+
+  max_step: 0,
+
+  average_steps_to_win: null,
+
+}
+
+const state = ref({
+
+  running: false,
+
+  mode: 'DEMO',
+
+  strategy_type: 'NEXT_GOAL',
+
+  strategy_name: 'Следующий гол',
+
+  status: 'STOPPED',
+
+  browser: { status: 'CLOSED', context: 'CLOSED', page: 'CLOSED' },
+
+  auth: { status: 'UNKNOWN' },
+
+  league: 'FC 25. 3x3. Лига Конференций',
+
+  message: 'Подключение к backend...',
+
+  error: null,
+
+  match: null,
+
+  scanner: { total: 0, started: 0, upcoming: 0, selected: null },
+
+  selected_team: null,
+
+  other_team: null,
+
+  selection_reason: null,
+
+  odds: {
+
+    selected: null,
+
+    opponent: null,
+
+    team1: null,
+
+    team2: null,
+
+    source: null,
+
+    backend: null,
+
+    confidence: null,
+
+    status: 'WAITING',
+
+  },
+
+  ocr: { status: 'NOT_USED_FOR_NEXT_GOAL', attempt: 0, max_attempts: 0, candidates: [] },
+
+  market_reader: { source: null, status: 'WAITING', attempt: 0 },
+
+  coupon_recovery: {
+    phase: 'IDLE',
+    attempt_id: null,
+    step: null,
+    amount: null,
+    selected_team: null,
+    score_before: null,
+    score_after: null,
+    cleanup_cycle: 0,
+    same_match: true,
+    same_team: true,
+    same_step: true,
+    message: null,
+  },
+
+  bet: { step: 0, max_steps: 7 },
+
+  budget: { initial_budget: 4142, current_budget: 4142, session_profit: 0 },
+
+  last_change: null,
+
+  stats: emptyStats,
+
+  run_time: {
+    enabled: false,
+    duration_hours: 3,
+    started_at: null,
+    deadline_at: null,
+    limit_reached: false,
+    awaiting_active_bet: false,
+    stopped_by_limit: false,
+  },
+
+  long_series: {
+    enabled: false,
+    min_step: 6,
+    state: 'OFF',
+    last_observed_series_length: null,
+    last_observed_series_match: null,
+    last_observed_is_long: null,
+    next_match: 'ALLOWED',
+    shadow_series_step: 0,
+    active_observation: null,
+    observations: [],
+  },
+
+  team1_profile: {
+    enabled: false,
+    max_odds: 2,
+    state: 'OFF',
+    active_observation: null,
+    observations: [],
+  },
+
+  favorite_shadow: {
+    enabled: false,
+    max_steps: 9,
+    state: 'OFF',
+    active_observations: {},
+    observations: [],
+    stats: {
+      completed: 0,
+      exhausted: 0,
+      interrupted: 0,
+      skipped: 0,
+      wins_by_step: {},
+    },
+  },
+
+  updated_at: null,
+
+})
+
+const history = ref([])
+
+const logs = ref([])
+
+const strategyConfig = ref({
+
+  strategy_type: 'NEXT_GOAL',
+
+  initial_stake: 20,
+
+  progression_multiplier: 2.2,
+
+  max_steps: 7,
+
+  stakes: [20, 44, 97, 213, 469, 1031, 2268],
+
+  required_budget: 4142,
+
+  exclude_teams_enabled: true,
+
+  min_initial_odds_enabled: true,
+
+  blocked_events_switch_enabled: false,
+
+  max_three_steps_enabled: false,
+
+  long_series_enabled: false,
+
+  team1_profile_enabled: false,
+
+  team1_profile_max_odds: 2,
+
+  favorite_shadow_enabled: false,
+
+  favorite_team1_enabled: false,
+
+  favorite_team1_min_odds: 2,
+
+  run_time_limit_enabled: false,
+
+  run_duration_hours: 3,
+
+})
+
+const backendError = ref('')
+
+const backendAvailable = ref(false)
+
+const selectedMode = ref('DEMO')
+
+const pendingAction = ref(null)
+
+const actionPending = computed(() => pendingAction.value !== null)
+
+const initialLoading = ref(true)
+
+let timer = null
+
+let tick = 0
+
+let refreshInFlight = false
+
+async function api(path, options = {}) {
+
+  const response = await fetch(apiUrl(path), {
+
+    cache: 'no-store',
+
+    headers: { 'Content-Type': 'application/json' },
+
+    ...options,
+
+  })
+
+  const contentType = response.headers.get('content-type') || ''
+
+  if (!contentType.includes('application/json')) {
+
+    throw new Error(`Backend вернул не JSON (${response.status})`)
+
+  }
+
+  const result = await response.json()
+
+  if (!response.ok) {
+
+    const detail = result.detail
+
+    const message = typeof detail === 'object' && detail !== null
+
+      ? [detail.code, detail.message].filter(Boolean).join(': ')
+
+      : detail
+
+    throw new Error(message || `HTTP ${response.status}`)
+
+  }
+
+  return result
+
+}
+
+async function loadState() {
+
+  try {
+
+    state.value = await api('/api/demo/state')
+
+    if (state.value.running && ['DEMO', 'LIVE'].includes(state.value.mode)) {
+
+      selectedMode.value = state.value.mode
+
+    }
+
+    backendAvailable.value = true
+
+    backendError.value = ''
+
+  } catch (error) {
+
+    backendAvailable.value = false
+
+    const message = error instanceof Error ? error.message : String(error)
+
+    backendError.value = `Backend недоступен: ${message}`
+
+  } finally {
+
+    initialLoading.value = false
+
+  }
+
+}
+
+async function loadDetails() {
+
+  try {
+
+    const historyMode = (state.value.running ? state.value.mode : selectedMode.value).toLowerCase()
+
+    const [historyData, logsData] = await Promise.all([
+
+      api(`/api/${historyMode}/history?limit=500`),
+
+      api('/api/demo/logs?limit=500'),
+
+    ])
+
+    history.value = Array.isArray(historyData.items) ? historyData.items : []
+
+    logs.value = Array.isArray(logsData.items) ? logsData.items : []
+
+  } catch (error) {
+
+    if (error instanceof TypeError) backendAvailable.value = false
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  }
+
+}
+
+async function loadStrategyConfig() {
+
+  try {
+
+    const config = await api('/api/demo/strategy-config')
+
+    strategyConfig.value = { ...config, stakes: [...config.stakes] }
+
+  } catch (error) {
+
+    if (error instanceof TypeError) backendAvailable.value = false
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  }
+
+}
+
+function regenerateStakes() {
+
+  const initial = Number(strategyConfig.value.initial_stake)
+
+  const multiplier = Number(strategyConfig.value.progression_multiplier)
+
+  const steps = Number(strategyConfig.value.max_steps)
+
+  if (!Number.isFinite(initial) || !Number.isFinite(multiplier) || !Number.isInteger(steps) || initial <= 0 || multiplier <= 1 || steps < 1) return
+
+  const stakes = [Math.round(initial * 100) / 100]
+
+  while (stakes.length < steps) stakes.push(Math.floor(stakes[stakes.length - 1] * multiplier))
+
+  strategyConfig.value.stakes = stakes
+
+}
+
+function updateStake(index, event) {
+
+  strategyConfig.value.stakes[index] = Number(event.target.value)
+
+}
+
+async function saveStrategy() {
+
+  pendingAction.value = 'save-strategy'
+
+  try {
+
+    const saved = await api('/api/demo/strategy-config', { method: 'PUT', body: JSON.stringify(strategyConfig.value) })
+
+    strategyConfig.value = { ...saved, stakes: [...saved.stakes] }
+
+    await loadState()
+
+  } catch (error) {
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+async function saveMatchFilters() {
+
+  pendingAction.value = 'save-match-filters'
+
+  try {
+
+    const saved = await api('/api/demo/strategy-config', { method: 'PUT', body: JSON.stringify(strategyConfig.value) })
+
+    strategyConfig.value = { ...saved, stakes: [...saved.stakes] }
+
+    await loadState()
+
+  } catch (error) {
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+    await loadStrategyConfig()
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+async function toggleTeam1ProfileFilter() {
+  if (strategyConfig.value.team1_profile_enabled) {
+    strategyConfig.value.favorite_team1_enabled = false
+  }
+  await saveMatchFilters()
+}
+
+async function toggleFavoriteTeam1Filter() {
+  if (strategyConfig.value.favorite_team1_enabled) {
+    strategyConfig.value.team1_profile_enabled = false
+  }
+  await saveMatchFilters()
+}
+
+async function selectStrategyType(strategyType) {
+
+  if (state.value.running || actionPending.value || strategyConfig.value.strategy_type === strategyType) return
+
+  const previous = strategyConfig.value.strategy_type
+
+  strategyConfig.value.strategy_type = strategyType
+
+
+  pendingAction.value = 'save-strategy-type'
+
+  try {
+
+    const saved = await api('/api/demo/strategy-config', { method: 'PUT', body: JSON.stringify(strategyConfig.value) })
+
+    strategyConfig.value = { ...saved, stakes: [...saved.stakes] }
+
+    backendError.value = ''
+
+    await loadState()
+
+  } catch (error) {
+
+    strategyConfig.value.strategy_type = previous
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+async function refresh() {
+
+  if (refreshInFlight) return
+
+  refreshInFlight = true
+
+  try {
+
+    await loadState()
+
+    tick += 1
+
+    if (backendAvailable.value && tick % 5 === 0) {
+
+      await loadDetails()
+
+    }
+
+  } finally {
+
+    refreshInFlight = false
+
+  }
+
+}
+
+async function startMode(mode) {
+
+  if (state.value.running || actionPending.value) return
+
+
+  selectedMode.value = mode
+
+  await control('start')
+
+}
+
+async function control(action) {
+
+  pendingAction.value = action
+
+  try {
+
+    const endpointMode = action === 'start'
+
+      ? selectedMode.value.toLowerCase()
+
+      : action === 'stop'
+
+        ? (state.value.mode || selectedMode.value).toLowerCase()
+
+        : 'demo'
+
+    state.value = await api(`/api/${endpointMode}/${action}`, {
+
+      method: 'POST'
+
+    })
+
+    backendError.value = ''
+
+    await loadDetails()
+
+  } catch (error) {
+
+    backendError.value = error instanceof Error
+
+      ? error.message
+
+      : String(error)
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+async function clearHistory() {
+
+  pendingAction.value = 'clear-history'
+
+  try {
+
+    const result = await api('/api/demo/history', { method: 'DELETE' })
+
+    history.value = Array.isArray(result.items) ? result.items : []
+
+    if (result.state) state.value = result.state
+
+    backendAvailable.value = true
+
+    backendError.value = ''
+
+    await loadDetails()
+
+  } catch (error) {
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+async function clearDatabase() {
+
+  const confirmed = window.confirm(
+
+    'Очистить всю DEMO-базу? История, логи, бюджет и настройки стратегии будут сброшены.'
+
+  )
+
+  if (!confirmed) return
+
+  pendingAction.value = 'clear-database'
+
+  try {
+
+    const result = await api('/api/demo/database', { method: 'DELETE' })
+
+    history.value = []
+
+    logs.value = []
+
+    if (result.state) {
+
+      state.value = result.state
+
+      strategyConfig.value = {
+
+        ...result.state.strategy_config,
+
+        stakes: [...result.state.strategy_config.stakes],
+
+      }
+
+    }
+
+    backendAvailable.value = true
+
+    backendError.value = ''
+
+  } catch (error) {
+
+    backendError.value = error instanceof Error ? error.message : String(error)
+
+  } finally {
+
+    pendingAction.value = null
+
+  }
+
+}
+
+function show(value, fallback = '—') {
+
+  return value === null || value === undefined || value === '' ? fallback : value
+
+}
+
+function formatNumber(value, digits = 2) {
+
+  const number = Number(value)
+
+  if (!Number.isFinite(number)) return '—'
+
+  return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: digits }).format(number)
+
+}
+
+const match = computed(() => state.value.match || {})
+
+const bet = computed(() => state.value.bet || {})
+
+const longSeries = computed(() => state.value.long_series || {})
+
+const activeObservation = computed(() => longSeries.value.active_observation || null)
+
+const observationHistory = computed(() => [...(longSeries.value.observations || [])].slice(-10).reverse())
+
+const team1Profile = computed(() => state.value.team1_profile || {})
+
+const team1ProfileActiveObservation = computed(() => team1Profile.value.active_observation || null)
+
+const team1ProfileObservationHistory = computed(() => [...(team1Profile.value.observations || [])].slice(-20).reverse())
+
+const team1ProfileObserving = computed(() => (
+  Boolean(team1Profile.value.enabled)
+  && team1Profile.value.state === 'OBSERVING'
+))
+
+const favoriteShadow = computed(() => state.value.favorite_shadow || {})
+
+const favoriteShadowActive = computed(() => Object.values(favoriteShadow.value.active_observations || {}))
+
+const favoriteShadowHistory = computed(() => [...(favoriteShadow.value.observations || [])].slice(-30).reverse())
+
+const favoriteShadowWins = computed(() => favoriteShadow.value.stats?.wins_by_step || {})
+
+const longSeriesWaiting = computed(() => (
+  Boolean(longSeries.value.enabled)
+  && longSeries.value.state === 'WAITING_FOR_LONG'
+))
+
+const stats = computed(() => ({ ...emptyStats, ...(state.value.stats || {}) }))
+
+const strategyComparison = computed(() => ([
+  ['Следующий гол', state.value.stats?.by_strategy?.NEXT_GOAL || emptyStats],
+  ['Ничья — 1-й тайм', state.value.stats?.by_strategy?.FIRST_HALF_DRAW || emptyStats],
+]))
+
+const lastChange = computed(() => state.value.last_change || {})
+
+const scanner = computed(() => state.value.scanner || {})
+
+const marketReader = computed(() => state.value.market_reader || {})
+
+const couponRecovery = computed(() => state.value.coupon_recovery || { phase: 'IDLE' })
+
+const couponRecoveryPhases = {
+  BLOCKED_COUPON: {
+    label: 'ЗАБЛОКИРОВАННЫЙ КУПОН',
+    icon: '🔒',
+    tone: 'blocked',
+    description: 'БК заблокировал выбранный исход. Шаг, сумма и команда сохранены.',
+  },
+  CLEARING_COUPON: {
+    label: 'УДАЛЯЕМ КУПОН',
+    icon: '🧹',
+    tone: 'clearing',
+    description: 'Новый коэффициент не кликаем, пока старый coupon не исчезнет.',
+  },
+  REFRESHING_SCORE: {
+    label: 'ПРОВЕРЯЕМ СЧЁТ',
+    icon: '↻',
+    tone: 'refreshing',
+    description: 'Coupon очищен. Бот перечитывает актуальный scoreboard.',
+  },
+  WAITING_NEW_MARKET: {
+    label: 'ЖДЁМ НОВЫЙ РЫНОК',
+    icon: '⌛',
+    tone: 'waiting',
+    description: 'Счёт обновлён. Ждём актуальный рынок следующего гола.',
+  },
+  RETRYING_SAME_STEP: {
+    label: 'ПОВТОРЯЕМ ТОТ ЖЕ ШАГ',
+    icon: '↺',
+    tone: 'retrying',
+    description: 'Повторяем в этом же матче на той же команде и с той же суммой.',
+  },
+}
+
+const couponRecoveryVisible = computed(() => {
+  const phase = String(couponRecovery.value.phase || 'IDLE').toUpperCase()
+  return Boolean(couponRecoveryPhases[phase])
+})
+
+const couponRecoveryView = computed(() => {
+  const phase = String(couponRecovery.value.phase || 'IDLE').toUpperCase()
+  return couponRecoveryPhases[phase] || null
+})
+
+const marketSource = computed(() => state.value.odds?.source || marketReader.value.source || null)
+
+const marketBackend = computed(() => state.value.odds?.backend || state.value.odds?.ocr_backend || null)
+
+const marketConfidence = computed(() => {
+  const raw = state.value.odds?.confidence
+  if (raw === null || raw === undefined || raw === '') return null
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return null
+  const normalized = value <= 1 ? value * 100 : value
+  return `${Math.round(normalized)}%`
+})
+
+const marketReadDescription = computed(() => {
+  const source = String(marketSource.value || '').toUpperCase()
+  if (source.includes('CANVAS_2D')) return 'Коэффициенты читаются напрямую из Canvas 2D через fillText/draw calls, без OCR.'
+  if (source.includes('CANVAS')) return 'Используется резервный Canvas-источник.'
+  if (source.includes('DOM')) return 'Коэффициенты прочитаны из DOM.'
+  return 'Ожидаем источник коэффициентов.'
+})
+
+const budget = computed(() => state.value.budget || {})
+
+const sequence = computed(() => state.value.sequence || {})
+
+const strategyPresentation = {
+  NEXT_GOAL: {
+    name: 'Следующий гол',
+    description: 'Ставка на следующий гол выбранной команды.',
+  },
+  FIRST_HALF_DRAW: {
+    name: 'Ничья — 1-й тайм',
+    description: 'Ставка на «Ничья» в рынке «1X2. 1-й тайм» с расчётом после окончания тайма.',
+  },
+}
+
+const selectedStrategyName = computed(() => (
+  strategyPresentation[strategyConfig.value.strategy_type]?.name || 'Следующий гол'
+))
+
+const selectedStrategyDescription = computed(() => (
+  strategyPresentation[strategyConfig.value.strategy_type]?.description
+    || strategyPresentation.NEXT_GOAL.description
+))
+
+const isFirstHalfDraw = computed(() => state.value.strategy_type === 'FIRST_HALF_DRAW')
+
+const strategyBudget = computed(() => strategyConfig.value.stakes.reduce((total, amount) => total + (Number(amount) || 0), 0))
+
+const configInvalid = computed(() => {
+
+  const config = strategyConfig.value
+
+  return !(Number(config.initial_stake) > 0)
+    || !(Number(config.progression_multiplier) > 1)
+    || !Number.isInteger(Number(config.max_steps))
+    || Number(config.max_steps) < 1
+    || config.stakes.length !== Number(config.max_steps)
+    || config.stakes.some((amount) => !Number.isFinite(Number(amount)) || Number(amount) <= 0)
+    || (config.team1_profile_enabled && !(Number(config.team1_profile_max_odds) > 0))
+    || (config.favorite_team1_enabled && !(Number(config.favorite_team1_min_odds) > 0))
+    || (config.team1_profile_enabled && config.favorite_team1_enabled)
+
+})
+
+const hasActiveBet = computed(() => (
+
+  state.value.bet?.result === 'ACTIVE'
+
+  || history.value.some((item) => (item.mode || 'DEMO') === 'DEMO' && item.result === 'ACTIVE')
+
+))
+
+const unresolvedSessionStatuses = new Set([
+  'RECOVERING',
+  'RECOVERY_REQUIRED',
+  'WAITING_FOR_MATCH_START',
+  'BET_SIMULATED',
+  'READY_FOR_MANUAL_CONFIRMATION',
+  'AWAITING_PLACEMENT_RESULT',
+  'BET_PLACED',
+  'ACTIVE',
+  'LIVE_MARKET_SELECTED',
+  'LIVE_COUPON_OPENED',
+  'LIVE_AMOUNT_FILLED',
+  'LIVE_AMOUNT_VERIFIED',
+])
+
+const sessionNeedsStop = computed(() => (
+  state.value.running
+  || state.value.bet?.result === 'ACTIVE'
+  || unresolvedSessionStatuses.has(String(state.value.status || '').toUpperCase())
+))
+
+const canStart = computed(() => (
+  backendAvailable.value
+  && !initialLoading.value
+  && !actionPending.value
+  && !state.value.running
+  && !sessionNeedsStop.value
+  && !configInvalid.value
+))
+
+const canStop = computed(() => (
+  backendAvailable.value
+  && !actionPending.value
+  && sessionNeedsStop.value
+))
+
+const canResetSequence = computed(() => backendAvailable.value && !actionPending.value && !state.value.running && selectedMode.value === 'DEMO')
+
+const canClearHistory = computed(() => backendAvailable.value && !actionPending.value && !state.value.running && !hasActiveBet.value && selectedMode.value === 'DEMO')
+
+const canClearDatabase = computed(() => backendAvailable.value && !actionPending.value && !state.value.running && !hasActiveBet.value)
+
+const reversedHistory = computed(() => [...history.value].reverse())
+
+const recentLogs = computed(() => logs.value.slice(-250))
+
+const bookmakerRecoveryEventPrefixes = [
+  'DEMO_VIRTUAL_BLOCKED_EVENT',
+  'DEMO_VIRTUAL_COUPON_CLEAR_',
+  'DEMO_VIRTUAL_STALE_COUPON_CLEAR_',
+  'DEMO_VIRTUAL_ERROR_COUPON_CLEAR_',
+  'DEMO_VIRTUAL_MARKET_STALE',
+  'DEMO_VIRTUAL_RETRY_SAME_SIDE',
+  'LIVE_UNACCEPTED_COUPON_CLEAR_',
+  'LIVE_MARKET_STALE_COUPON_CLEAR_',
+  'LIVE_MARKET_STALE_BEFORE_CLICK',
+  'LIVE_UNACCEPTED_KEEP_SIDE',
+  'LIVE_UNACCEPTED_STEP_PRESERVED',
+]
+
+const bookmakerLockEvents = new Set([
+  'DEMO_PREBET_CANVAS_LOCK_CHECK',
+  'DEMO_PREBET_CANVAS_LOCKED',
+  'DEMO_PREBET_CANVAS_UNLOCKED',
+  'DEMO_PREBET_CANVAS_LOCK_STATE_UNAVAILABLE',
+  'DEMO_BLOCKED_ODDS_VISIBLE',
+  'CANVAS_2D_LOCK_ACTIVE',
+  'CANVAS_2D_LOCK_RELEASED',
+  'CANVAS_2D_LOCK_DETECTED',
+  'CANVAS_2D_LOCKED_USING_LAST_ODDS',
+  'ACTIVE_BET_LOCK_MONITOR_STARTED',
+  'ACTIVE_BET_LOCK_ACTIVE',
+  'ACTIVE_BET_LOCK_RELEASED',
+  'ACTIVE_BET_LOCK_STATE_UNAVAILABLE',
+  'ACTIVE_BET_LOCK_MONITOR_ERROR',
+  'ACTIVE_BET_GOAL_LOCK_CONTEXT',
+  'ACTIVE_BET_GOAL_DURING_LOCK',
+  'DEMO_STEP_ARMING',
+  'DEMO_OPEN_CONFIRMATION_RESET',
+  'DEMO_SCORE_CHANGED_BEFORE_ACCEPTANCE',
+  'DEMO_BET_ACCEPTANCE_CONFIRMED',
+])
+
+function isBookmakerLockLog(item) {
+  const event = String(item?.event || '')
+  return bookmakerLockEvents.has(event)
+    || bookmakerRecoveryEventPrefixes.some((prefix) => event.startsWith(prefix))
+}
+
+function isBookmakerUnlockLog(item) {
+  const event = String(item?.event || '')
+  return (
+    event === 'DEMO_PREBET_CANVAS_UNLOCKED'
+    || event === 'CANVAS_2D_LOCK_RELEASED'
+    || event === 'ACTIVE_BET_LOCK_RELEASED'
+    || event === 'DEMO_BET_ACCEPTANCE_CONFIRMED'
+    || event.includes('COUPON_CLEAR_RECOVERED')
+  )
+}
+
+function isBookmakerGoalDuringLockLog(item) {
+  return String(item?.event || '') === 'ACTIVE_BET_GOAL_DURING_LOCK'
+}
+
+function bookmakerLogLabel(item) {
+  const event = String(item?.event || '')
+  if (event === 'DEMO_PREBET_CANVAS_LOCKED') return 'БЛОКИРОВКА БК'
+  if (event === 'DEMO_PREBET_CANVAS_UNLOCKED') return 'ЗАМОК СНЯТ'
+  if (event === 'DEMO_PREBET_CANVAS_LOCK_CHECK') return 'ПРОВЕРКА ЗАМКА'
+  if (event === 'DEMO_PREBET_CANVAS_LOCK_STATE_UNAVAILABLE') return 'ЗАМОК: НЕТ ДАННЫХ'
+  if (event === 'DEMO_BLOCKED_ODDS_VISIBLE') return 'КФ ВИДЕН, ЗАМОК ЕЩЁ АКТИВЕН'
+  if (event === 'CANVAS_2D_LOCK_ACTIVE') return 'ЗАМОК АКТИВЕН'
+  if (event === 'CANVAS_2D_LOCK_RELEASED') return 'ЗАМОК СНЯТ CANVAS'
+  if (event === 'CANVAS_2D_LOCK_DETECTED') return 'ЗАМОК ОБНАРУЖЕН'
+  if (event === 'CANVAS_2D_LOCKED_USING_LAST_ODDS') return 'ЗАМОК CANVAS'
+  if (event === 'ACTIVE_BET_LOCK_MONITOR_STARTED') return 'МОНИТОР ЗАМКА АКТИВЕН'
+  if (event === 'ACTIVE_BET_LOCK_ACTIVE') return 'БЛОКИРОВКА ПРИ АКТИВНОЙ СТАВКЕ'
+  if (event === 'ACTIVE_BET_LOCK_RELEASED') return 'БЛОКИРОВКА СНЯТА'
+  if (event === 'ACTIVE_BET_LOCK_STATE_UNAVAILABLE') return 'ЗАМОК: НЕТ ДАННЫХ'
+  if (event === 'ACTIVE_BET_LOCK_MONITOR_ERROR') return 'ОШИБКА МОНИТОРА ЗАМКА'
+  if (event === 'ACTIVE_BET_GOAL_LOCK_CONTEXT') return 'КОНТЕКСТ ГОЛА / ЗАМКА'
+  if (event === 'ACTIVE_BET_GOAL_DURING_LOCK') return 'ГОЛ ПРИ БЛОКИРОВКЕ'
+  if (event === 'MATCH_CONSECUTIVE_LOSSES') return 'ПРОИГРЫШИ В МАТЧЕ'
+  if (event === 'MAX_3_STEPS_LIMIT_REACHED') return 'MAX 3: ЛИМИТ ДОСТИГНУТ'
+  if (event === 'MAX_3_STEPS_SWITCHING_MATCH') return 'MAX 3: СМЕНА МАТЧА'
+  if (event === 'MAX_3_STEPS_CONTINUING_TO_END') return 'MAX 3: ВТОРОЙ МАТЧ ДО КОНЦА'
+  if (event === 'DEMO_STEP_ARMING') return 'ШАГ: ОЖИДАНИЕ ПРИНЯТИЯ'
+  if (event === 'DEMO_OPEN_CONFIRMATION') return 'РЫНОК СВОБОДЕН'
+  if (event === 'DEMO_OPEN_CONFIRMATION_RESET') return 'ПРИНЯТИЕ СБРОШЕНО'
+  if (event === 'DEMO_SCORE_CHANGED_BEFORE_ACCEPTANCE') return 'СЧЁТ ИЗМЕНИЛСЯ ДО ПРИНЯТИЯ'
+  if (event === 'DEMO_BET_ACCEPTANCE_CONFIRMED') return 'ПРИНЯТИЕ ПОДТВЕРЖДЕНО'
+  if (event === 'ACTIVE_BET_RESOLVED_DURING_LIVE_START') return 'ГОЛ УЖЕ ПРОИЗОШЁЛ ПРИ СТАРТЕ LIVE'
+  if (event === 'DEMO_VIRTUAL_BLOCKED_EVENT') return '🔒 ЗАБЛОКИРОВАННЫЙ КУПОН'
+  if (event.includes('COUPON_CLEAR_WAIT')) return '🧹 УДАЛЯЕМ КУПОН'
+  if (event.includes('COUPON_CLEAR_RECOVERED')) return '✓ КУПОН УДАЛЁН'
+  if (event === 'DEMO_VIRTUAL_MARKET_STALE' || event === 'LIVE_MARKET_STALE_BEFORE_CLICK') return '↻ ОБНОВЛЯЕМ РЫНОК'
+  if (event === 'DEMO_VIRTUAL_RETRY_SAME_SIDE') return '↺ ТОТ ЖЕ ШАГ / ТА ЖЕ КОМАНДА'
+  if (event === 'LIVE_UNACCEPTED_KEEP_SIDE') return '↺ ТА ЖЕ КОМАНДА'
+  if (event === 'LIVE_UNACCEPTED_STEP_PRESERVED') return '✓ ШАГ СОХРАНЁН'
+  return event
+}
+
+const profitTone = computed(() => Number(budget.value.session_profit || 0) >= 0 ? 'green' : 'red')
+
+const signedProfit = computed(() => {
+
+  const value = Number(budget.value.session_profit)
+
+  if (!Number.isFinite(value)) return '—'
+
+  return `${value >= 0 ? '+' : ''}${formatNumber(value)}`
+
+})
+
+const authStatus = computed(() => state.value.auth?.status || 'UNKNOWN')
+
+const authStage = computed(() => {
+
+  if (authStatus.value === 'AUTHORIZED') {
+
+    return {
+
+      tone: 'authorized',
+
+      title: 'Авторизация выполнена',
+
+      message: 'Вход подтверждён по блоку баланса. Бот продолжил работу автоматически.',
+
+      status: 'Авторизован',
+
+    }
+
+  }
+
+  if (authStatus.value === 'WAITING_MANUAL_LOGIN') {
+
+    return {
+
+      tone: 'waiting',
+
+      title: 'Авторизация',
+
+      message: 'Браузер открыт. Войдите на сайте вручную.',
+
+      status: 'Ожидание входа',
+
+    }
+
+  }
+
+  return {
+
+    tone: 'checking',
+
+    title: 'Авторизация',
+
+    message: 'Открываем сайт и проверяем сохранённую сессию.',
+
+    status: 'Проверка авторизации',
+
+  }
+
+})
+
+const scoreText = computed(() => {
+
+  if (match.value.score1 === null || match.value.score1 === undefined) return '— : —'
+
+  return `${match.value.score1} : ${match.value.score2}`
+
+})
+
+const statusTone = computed(() => {
+
+  if (state.value.status === 'ERROR') return 'danger'
+
+  if (state.value.status === 'STOPPED') return 'neutral'
+
+  if (state.value.status === 'WAITING_MANUAL_LOGIN') return 'warning'
+
+  if (state.value.status === 'AUTHORIZED') return 'success'
+
+  if (['WIN', 'GOAL_DETECTED'].includes(state.value.status)) return 'success'
+
+  if (['LOSE', 'SEQUENCE_EXHAUSTED'].includes(state.value.status)) return 'warning'
+
+  return 'active'
+
+})
+
+const runTime = computed(() => state.value.run_time || {})
+
+const runTimeDeadlineLabel = computed(() => {
+  const raw = runTime.value.deadline_at
+  if (!raw) return '—'
+  const date = new Date(raw)
+  return Number.isNaN(date.getTime())
+    ? raw
+    : date.toLocaleString('ru-RU', {
+        hour: '2-digit',
+        minute: '2-digit',
+        day: '2-digit',
+        month: '2-digit',
+      })
+})
+
+const runTimeRemaining = computed(() => {
+  if (!runTime.value.enabled) return 'Без ограничения'
+  if (runTime.value.stopped_by_limit) return '00:00:00'
+  const raw = runTime.value.deadline_at
+  if (!raw) return `${runTime.value.duration_hours || strategyConfig.value.run_duration_hours || 3} ч`
+  const deadline = new Date(raw).getTime()
+  if (!Number.isFinite(deadline)) return '—'
+  const remaining = Math.max(0, deadline - Date.now())
+  const totalSeconds = Math.floor(remaining / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return [hours, minutes, seconds]
+    .map((value) => String(value).padStart(2, '0'))
+    .join(':')
+})
+
+const updatedAt = computed(() => {
+
+  if (!state.value.updated_at) return '—'
+
+  const date = new Date(state.value.updated_at)
+
+  return Number.isNaN(date.getTime()) ? state.value.updated_at : date.toLocaleTimeString('ru-RU')
+
+})
+
+onMounted(async () => {
+
+  await Promise.all([loadState(), loadDetails(), loadStrategyConfig()])
+
+  timer = setInterval(refresh, 1000)
+
+})
+
+onBeforeUnmount(() => {
+
+  if (timer) clearInterval(timer)
+
+})
+
+</script>
+
+<template>
+
+  <div class="app-shell">
+
+    <header class="topbar">
+
+      <div class="brand">
+
+        <div class="brand-mark">AB</div>
+
+        <div>
+
+          <div class="brand-title">{{ state.running ? state.mode : selectedMode }} MONITOR</div>
+
+          <div class="brand-subtitle">AutoBet · FC 25 Live Strategy</div>
+
+        </div>
+
+      </div>
+
+      <div class="controls">
+
+        <div class="demo-chip">{{ state.running ? state.mode : 'ГОТОВ' }}</div>
+
+        <button
+          class="button button-start"
+          :disabled="!canStart"
+          @click="startMode('DEMO')"
+        >
+          {{ pendingAction === 'start' && selectedMode === 'DEMO'
+            ? 'Запуск DEMO...'
+            : 'Запустить DEMO'
+          }}
+        </button>
+
+        <button
+          class="button button-danger"
+          :disabled="!canStart"
+          @click="startMode('LIVE')"
+        >
+          {{ pendingAction === 'start' && selectedMode === 'LIVE'
+            ? 'Запуск боевого режима...'
+            : 'БОЕВОЙ РЕЖИМ'
+          }}
+        </button>
+
+        <button
+          class="button button-stop"
+          :disabled="!canStop"
+          @click="control('stop')"
+        >
+          {{
+            pendingAction === 'stop'
+              ? 'Остановка...'
+              : state.running
+                ? 'Остановить'
+                : sessionNeedsStop
+                  ? 'Завершить зависшую сессию'
+                  : 'Остановить'
+          }}
+        </button>
+
+        <button class="button" :disabled="!canResetSequence" @click="control('reset')">Новая серия</button>
+
+        <button class="button button-danger" :disabled="!canClearDatabase" @click="clearDatabase">
+
+          {{ pendingAction === 'clear-database' ? 'Очистка...' : 'Очистить базу данных' }}
+
+        </button>
+
+      </div>
+
+    </header>
+
+    <main class="dashboard">
+
+      <section :class="['demo-notice', { 'live-notice': (state.running ? state.mode : selectedMode) === 'LIVE' }]">
+
+        <span class="notice-icon">{{ (state.running ? state.mode : selectedMode) === 'LIVE' ? 'L' : 'D' }}</span>
+
+        <div>
+
+          <strong>{{ (state.running ? state.mode : selectedMode) }}-РЕЖИМ</strong>
+
+          <span v-if="(state.running ? state.mode : selectedMode) === 'LIVE'">Coupon заполняется автоматически, но кнопку «Сделать ставку» нажимает пользователь.</span>
+
+          <span v-else>Реальные ставки не отправляются. Все действия стратегии виртуальные.</span>
+
+        </div>
+
+      </section>
+
+      <section v-if="state.running && runTime.enabled" class="run-time-stage">
+
+        <div>
+
+          <strong>Лимит сессии · {{ runTimeRemaining }}</strong>
+
+          <span v-if="runTime.awaiting_active_bet">Время вышло: ждём расчёта уже ACCEPTED ставки, новых ставок не будет.</span>
+
+          <span v-else>DEMO/LIVE остановит новые ставки в {{ runTimeDeadlineLabel }}.</span>
+
+        </div>
+
+        <small>{{ runTime.duration_hours }} ч</small>
+
+      </section>
+
+      <section v-if="state.status === 'READY_FOR_MANUAL_CONFIRMATION'" class="auth-stage auth-stage-waiting">
+
+        <div>
+
+          <strong>Подтвердите LIVE-ставку</strong>
+
+          <span>Проверьте coupon и один раз нажмите «Сделать ставку» в окне букмекера.</span>
+
+        </div>
+
+        <small>Шаг {{ bet.step }} · {{ bet.amount }} RUB · гол №{{ bet.next_goal_number }}</small>
+
+      </section>
+
+      <section
+
+        v-if="state.running"
+
+        :class="['auth-stage', `auth-stage-${authStage.tone}`]"
+
+      >
+
+        <div>
+
+          <strong>{{ authStage.title }}</strong>
+
+          <span>{{ authStage.message }}</span>
+
+        </div>
+
+        <small>Статус: {{ authStage.status }}</small>
+
+      </section>
+
+      <div v-if="backendError" class="alert alert-error">
+
+        <strong>Backend недоступен</strong>
+
+        <span>{{ backendError }}</span>
+
+      </div>
+
+      <div v-if="state.error" class="alert alert-error">
+
+        <strong>{{ state.status }}</strong>
+
+        <span>{{ state.error }}</span>
+
+      </div>
+
+      <section class="strategy-config panel">
+
+        <header class="panel-header compact">
+
+          <div><span class="eyebrow amber">STRATEGY</span><h2>Настройка стратегии</h2></div>
+
+          <strong :class="configInvalid ? 'red' : 'green'">{{ configInvalid ? 'Проверьте значения' : `Бюджет ряда: ${formatNumber(strategyBudget)} ₽` }}</strong>
+
+        </header>
+
+        <div class="strategy-picker">
+
+          <div class="strategy-picker-heading">
+
+            <div><span class="eyebrow">ACTIVE STRATEGY</span><h3>Стратегия</h3></div>
+
+            <small>{{ pendingAction === 'save-strategy-type' ? 'Сохраняем...' : 'Одновременно работает только одна стратегия' }}</small>
+
+          </div>
+
+          <div class="strategy-option-grid">
+
+            <label :class="['strategy-option', { selected: strategyConfig.strategy_type === 'NEXT_GOAL' }]">
+
+              <input type="checkbox" :checked="strategyConfig.strategy_type === 'NEXT_GOAL'" :disabled="state.running || actionPending" @click.prevent="selectStrategyType('NEXT_GOAL')">
+
+              <span><strong>Следующий гол</strong><small>Текущая стратегия без изменения алгоритма</small></span>
+
+            </label>
+
+            <label :class="['strategy-option', { selected: strategyConfig.strategy_type === 'FIRST_HALF_DRAW' }]">
+
+              <input type="checkbox" :checked="strategyConfig.strategy_type === 'FIRST_HALF_DRAW'" :disabled="state.running || actionPending" @click.prevent="selectStrategyType('FIRST_HALF_DRAW')">
+
+              <span><strong>Ничья — 1-й тайм</strong><small>DEMO и LIVE · расчёт после окончания тайма</small></span>
+
+            </label>
+
+          </div>
+
+          <p class="strategy-description"><strong>{{ selectedStrategyName }}</strong> · {{ selectedStrategyDescription }}</p>
+
+        </div>
+
+        <div class="strategy-config-body">
+
+          <label>Первоначальная ставка<input v-model.number="strategyConfig.initial_stake" type="number" min="0.01" step="0.01" @change="regenerateStakes"></label>
+
+          <label>Множитель следующей ставки<input v-model.number="strategyConfig.progression_multiplier" type="number" min="1.01" step="0.01" @change="regenerateStakes"></label>
+
+          <label>Количество шагов<input v-model.number="strategyConfig.max_steps" type="number" min="1" step="1" @change="regenerateStakes"></label>
+
+          <button class="button" :disabled="state.running || actionPending" @click="regenerateStakes">Рассчитать ряд</button>
+
+        </div>
+
+        <div class="match-filters">
+
+          <div class="match-filters-heading">
+
+            <div><span class="eyebrow amber">MATCH FILTERS</span><h3>Фильтры матчей</h3></div>
+
+            <small>{{ pendingAction === 'save-match-filters' ? 'Сохраняем...' : 'Изменения сохраняются автоматически' }}</small>
+
+          </div>
+
+          <div class="match-filter-grid">
+
+            <label :class="['match-filter-option', { 'filter-disabled': !strategyConfig.exclude_teams_enabled }]">
+
+              <input v-model="strategyConfig.exclude_teams_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+              <span class="filter-copy"><strong>Chelsea / Roma</strong><small>Пропускать матчи с Chelsea и Roma</small></span>
+
+              <span class="filter-state">{{ strategyConfig.exclude_teams_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+            </label>
+
+            <label :class="['match-filter-option', { 'filter-disabled': !strategyConfig.min_initial_odds_enabled }]">
+
+              <input v-model="strategyConfig.min_initial_odds_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+              <span class="filter-copy"><strong>Коэффициент от 1.93</strong><small>Минимальный коэффициент выбранной команды для входа в новую серию</small></span>
+
+              <span class="filter-state">{{ strategyConfig.min_initial_odds_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+            </label>
+
+            <label v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.blocked_events_switch_enabled }]">
+
+              <input v-model="strategyConfig.blocked_events_switch_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+              <span class="filter-copy"><strong>Заблокированные события</strong><small>Контролировать пропущенный гол выбранной команды во время блокировки</small></span>
+
+              <span class="filter-state">{{ strategyConfig.blocked_events_switch_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+            </label>
+
+            <label v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.max_three_steps_enabled }]">
+
+              <input v-model="strategyConfig.max_three_steps_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+              <span class="filter-copy"><strong>max 3 шага</strong><small>DEMO и LIVE: после 3 принятых проигранных ставок перейти на второй матч с шага 4; блокировки и NOT_PLACED шаг не расходуют</small></span>
+
+              <span class="filter-state">{{ strategyConfig.max_three_steps_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+            </label>
+
+            <label v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.long_series_enabled }]">
+
+              <input v-model="strategyConfig.long_series_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+              <span class="filter-copy"><strong>LONG_SERIES</strong><small>Вход только в первый новый матч после длинной серии {{ state.long_series?.min_step || 6 }}+</small></span>
+
+              <span class="filter-state">{{ strategyConfig.long_series_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+            </label>
+
+            <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.team1_profile_enabled }]">
+              <input v-model="strategyConfig.team1_profile_enabled" type="checkbox" :disabled="state.running || actionPending" @change="toggleTeam1ProfileFilter">
+              <span class="filter-copy">
+                <strong>TEAM_1 + КФ ниже</strong>
+                <small>Ставим только если выбранная по большему кф команда стоит слева (Команда 1) и кф ниже порога. Остальные матчи записываем в Наблюдение. При включении профиль сам задаёт правило входа вместо минимума 1.93.</small>
+              </span>
+              <span class="filter-state">{{ strategyConfig.team1_profile_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+              <input
+                v-model.number="strategyConfig.team1_profile_max_odds"
+                class="profile-odds-input"
+                type="number"
+                min="1.01"
+                step="0.001"
+                :disabled="state.running || actionPending || !strategyConfig.team1_profile_enabled"
+                title="Верхняя граница не включается: при 2.00 допускается только кф < 2.00"
+                @change="saveMatchFilters"
+              >
+            </div>
+
+            <label v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.favorite_shadow_enabled }]">
+              <input v-model="strategyConfig.favorite_shadow_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+              <span class="filter-copy">
+                <strong>FAVORITE SHADOW</strong>
+                <small>Отдельно и без ставок отслеживать фаворита по меньшему стартовому кф до его гола. Сохраняются шаги 1–9 и доступность рынка на каждом шаге.</small>
+              </span>
+              <span class="filter-state">{{ strategyConfig.favorite_shadow_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+            </label>
+
+            <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" :class="['match-filter-option', { 'filter-disabled': !strategyConfig.favorite_team1_enabled }]">
+              <input v-model="strategyConfig.favorite_team1_enabled" type="checkbox" :disabled="state.running || actionPending" @change="toggleFavoriteTeam1Filter">
+              <span class="filter-copy">
+                <strong>FAVORITE + TEAM_1</strong>
+                <small>Реальная стратегия выбирает меньший стартовый кф и ставит только когда фаворит находится слева (Команда 1) и его кф не ниже заданного порога. Фаворит справа, равные кф и кф ниже порога — пропуск. Общий фильтр «кф от 1.93» при этом не применяется.</small>
+              </span>
+              <span class="filter-state">{{ strategyConfig.favorite_team1_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+              <input
+                v-model.number="strategyConfig.favorite_team1_min_odds"
+                class="profile-odds-input"
+                type="number"
+                min="1.01"
+                step="0.001"
+                :disabled="state.running || actionPending || !strategyConfig.favorite_team1_enabled"
+                title="Нижняя граница включается: при 2.00 бот ставит только при кф фаворита ≥ 2.00"
+                @change="saveMatchFilters"
+              >
+            </div>
+
+          </div>
+
+          <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL'" class="long-series-status">
+            <div><span>LONG_SERIES</span><strong>{{ state.long_series?.state || 'OFF' }}</strong></div>
+            <div><span>Последняя серия</span><strong>{{ state.long_series?.last_observed_series_match || '—' }}</strong><small v-if="state.long_series?.last_observed_series_length">{{ state.long_series.last_observed_series_length }} шагов · {{ state.long_series.last_observed_is_long ? 'LONG' : 'SHORT' }}</small></div>
+            <div><span>Текущий shadow-шаг</span><strong>{{ state.long_series?.shadow_series_step || '—' }}</strong></div>
+            <div><span>Следующий матч</span><strong>{{ state.long_series?.next_match || (strategyConfig.long_series_enabled ? 'SKIP' : 'ALLOWED') }}</strong></div>
+          </div>
+
+          <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL' && strategyConfig.team1_profile_enabled" class="long-series-status">
+            <div><span>TEAM_1 PROFILE</span><strong>{{ team1Profile.state || 'READY' }}</strong></div>
+            <div><span>Условие</span><strong>Команда 1</strong><small>выбрана по большему кф</small></div>
+            <div><span>Коэффициент</span><strong>&lt; {{ strategyConfig.team1_profile_max_odds }}</strong></div>
+            <div><span>Наблюдений</span><strong>{{ (team1Profile.observations || []).length }}</strong></div>
+          </div>
+
+          <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL' && strategyConfig.favorite_shadow_enabled" class="long-series-status">
+            <div><span>FAVORITE SHADOW</span><strong>{{ favoriteShadow.state || 'READY' }}</strong></div>
+            <div><span>Активно</span><strong>{{ favoriteShadowActive.length }}</strong><small>отдельных read-only вкладок</small></div>
+            <div><span>Завершено</span><strong>{{ favoriteShadow.stats?.completed || 0 }}</strong></div>
+            <div><span>1 / 2 / 3 / 4 шаг</span><strong>{{ favoriteShadowWins['1'] || 0 }} / {{ favoriteShadowWins['2'] || 0 }} / {{ favoriteShadowWins['3'] || 0 }} / {{ favoriteShadowWins['4'] || 0 }}</strong></div>
+          </div>
+
+          <div v-if="strategyConfig.strategy_type === 'NEXT_GOAL' && strategyConfig.favorite_team1_enabled" class="long-series-status">
+            <div><span>FAVORITE + TEAM_1</span><strong>ВКЛ</strong></div>
+            <div><span>Выбор</span><strong>Меньший кф</strong><small>фаворит</small></div>
+            <div><span>Сторона</span><strong>Команда 1</strong><small>только слева</small></div>
+            <div><span>КФ от</span><strong>{{ formatNumber(strategyConfig.favorite_team1_min_odds, 3) }}</strong><small>граница включительно</small></div>
+            <div><span>Остальные</span><strong>SKIP</strong><small>TEAM_2 / равные / кф ниже порога</small></div>
+          </div>
+
+        </div>
+
+        <div class="run-time-settings">
+
+          <div class="match-filters-heading">
+
+            <div><span class="eyebrow amber">SESSION TIMER</span><h3>Время работы бота</h3></div>
+
+            <small>Backend сам остановит новые ставки по истечении лимита</small>
+
+          </div>
+
+          <label :class="['match-filter-option', 'run-time-toggle', { 'filter-disabled': !strategyConfig.run_time_limit_enabled }]">
+
+            <input v-model="strategyConfig.run_time_limit_enabled" type="checkbox" :disabled="state.running || actionPending" @change="saveMatchFilters">
+
+            <span class="filter-copy"><strong>Ограничить время работы</strong><small>Одинаково для DEMO и LIVE. Уже принятую ставку бот сначала рассчитает.</small></span>
+
+            <span class="filter-state">{{ strategyConfig.run_time_limit_enabled ? 'ВКЛ' : 'ВЫКЛ' }}</span>
+
+          </label>
+
+          <div class="run-duration-grid">
+
+            <label
+              v-for="hours in [3, 6, 12, 24]"
+              :key="hours"
+              :class="['run-duration-option', { selected: Number(strategyConfig.run_duration_hours) === hours }]"
+            >
+
+              <input
+                v-model.number="strategyConfig.run_duration_hours"
+                type="radio"
+                name="run-duration-hours"
+                :value="hours"
+                :disabled="state.running || actionPending || !strategyConfig.run_time_limit_enabled"
+                @change="saveMatchFilters"
+              >
+
+              <strong>{{ hours }} ч</strong>
+
+            </label>
+
+          </div>
+
+        </div>
+
+        <div class="stake-row">
+
+          <label v-for="(stake, index) in strategyConfig.stakes" :key="index">Шаг {{ index + 1 }}<input :value="stake" type="number" min="0.01" step="0.01" @input="updateStake(index, $event)"></label>
+
+        </div>
+
+        <footer class="strategy-config-footer">
+
+          <span>Сохранённый ряд применяется при следующем запуске. Вручную изменённые суммы имеют приоритет.</span>
+
+          <button class="button button-start" :disabled="state.running || actionPending || configInvalid" @click="saveStrategy">Сохранить настройки</button>
+
+        </footer>
+
+      </section>
+
+      <section class="overview-grid">
+
+        <article class="metric-card">
+
+          <span>BROWSER</span>
+
+          <strong :class="state.browser?.status === 'OPEN' ? 'tone-success' : 'tone-danger'">
+
+            <i class="status-dot" />{{ show(state.browser?.status, 'CLOSED') }}
+
+          </strong>
+
+        </article>
+
+        <article class="metric-card">
+
+          <span>{{ state.running ? state.mode : selectedMode }} WORKER</span>
+
+          <strong :class="state.running ? 'tone-active' : 'tone-neutral'">
+
+            <i class="status-dot" />{{ state.running ? 'RUNNING' : 'STOPPED' }}
+
+          </strong>
+
+        </article>
+
+        <article class="metric-card">
+
+          <span>AUTH</span>
+
+          <strong>{{ show(state.auth?.status, 'UNKNOWN') }}</strong>
+
+        </article>
+
+        <article class="metric-card">
+
+          <span>STRATEGY STATE</span>
+
+          <strong :class="`tone-${statusTone}`"><i class="status-dot" />{{ state.status }}</strong>
+
+        </article>
+
+      </section>
+
+      <section class="status-line">
+
+        <span :class="`pulse tone-${statusTone}`" />
+
+        <strong>{{ state.message }}</strong>
+
+        <span class="status-context">Стратегия: {{ state.strategy_name || selectedStrategyName }} · {{ state.mode }} · {{ state.league }} · {{ updatedAt }}</span>
+
+      </section>
+
+      <div v-if="initialLoading" class="loading-card">Получаем состояние DEMO worker...</div>
+
+      <template v-else>
+
+        <section class="scanner-grid">
+
+          <article class="metric-card"><span>НАЙДЕНО ВСЕГО</span><strong>{{ scanner.total || 0 }}</strong></article>
+
+          <article class="metric-card"><span>УЖЕ ИДЁТ</span><strong>{{ scanner.started || 0 }}</strong></article>
+
+          <article class="metric-card"><span>ПРЕДСТОЯЩИХ</span><strong>{{ scanner.upcoming || 0 }}</strong></article>
+
+          <article class="metric-card scanner-selected">
+
+            <span>БЛИЖАЙШИЙ МАТЧ</span>
+
+            <strong v-if="scanner.selected">
+
+              {{ scanner.selected.team1 }} — {{ scanner.selected.team2 }} · {{ scanner.selected.time }}
+
+            </strong>
+
+            <strong v-else>—</strong>
+
+          </article>
+
+        </section>
+
+        <section v-if="strategyConfig.strategy_type === 'NEXT_GOAL' && (strategyConfig.favorite_shadow_enabled || favoriteShadow.enabled)" class="full-width-section observation-section">
+
+          <article class="panel observation-panel">
+            <header class="panel-header compact">
+              <div><span class="eyebrow amber">FAVORITE SHADOW</span><h2>Фаворит до следующего гола</h2></div>
+              <span :class="['observation-state', String(favoriteShadow.state || 'OFF').toLowerCase()]">FAVORITE: {{ favoriteShadow.state || 'OFF' }}</span>
+            </header>
+
+            <div v-if="!favoriteShadow.enabled" class="panel-empty">FAVORITE SHADOW выключен</div>
+            <template v-else>
+              <div class="observation-history">
+                <h3>Активные наблюдения</h3>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Матч</th><th>Фаворит</th><th>Сторона</th><th>Старт. кф</th><th>Шаг</th><th>Счёт</th><th>Кф шага</th><th>Рынок</th></tr></thead>
+                    <tbody>
+                      <tr v-for="item in favoriteShadowActive" :key="`favorite-active-${item.match_id}`">
+                        <td>{{ item.match_name }}</td>
+                        <td>{{ item.favorite_team }}</td>
+                        <td>{{ item.favorite_side_label }}</td>
+                        <td>{{ show(item.initial_favorite_odds) }}</td>
+                        <td>{{ item.shadow_step || 1 }} / {{ favoriteShadow.max_steps || 9 }}</td>
+                        <td>{{ show(item.score_before) }} → {{ show(item.score_after) }}</td>
+                        <td>{{ show(item.current_favorite_odds) }}</td>
+                        <td>{{ item.market_ready ? 'READY' : 'NO ODDS' }}</td>
+                      </tr>
+                      <tr v-if="!favoriteShadowActive.length"><td colspan="8" class="empty-row">Активных наблюдений сейчас нет</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="observation-history">
+                <h3>Распределение закрытия FAVORITE SHADOW</h3>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Шаг</th><th v-for="stepNumber in 9" :key="`favorite-step-head-${stepNumber}`">{{ stepNumber }}</th><th>9+</th><th>INTERRUPTED</th><th>SKIPPED</th></tr></thead>
+                    <tbody>
+                      <tr>
+                        <td>Серий</td>
+                        <td v-for="stepNumber in 9" :key="`favorite-step-value-${stepNumber}`">{{ favoriteShadowWins[stepNumber] || 0 }}</td>
+                        <td>{{ favoriteShadow.stats?.exhausted || 0 }}</td>
+                        <td>{{ favoriteShadow.stats?.interrupted || 0 }}</td>
+                        <td>{{ favoriteShadow.stats?.skipped || 0 }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="observation-history">
+                <h3>Последние наблюдения фаворита</h3>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Матч</th><th>Фаворит</th><th>Старт. кф</th><th>Аутсайдер</th><th>Кф аутс.</th><th>Шаг гола</th><th>Статус</th><th>Причина</th></tr></thead>
+                    <tbody>
+                      <tr v-for="item in favoriteShadowHistory" :key="`favorite-${item.match_id}-${item.completed_at}`">
+                        <td>{{ item.match_name }}</td>
+                        <td>{{ show(item.favorite_team) }}</td>
+                        <td>{{ show(item.initial_favorite_odds) }}</td>
+                        <td>{{ show(item.outsider_team) }}</td>
+                        <td>{{ show(item.initial_outsider_odds) }}</td>
+                        <td>{{ item.winning_step || (item.completion_status === 'EXHAUSTED' ? '9+' : '—') }}</td>
+                        <td>{{ show(item.completion_status) }}</td>
+                        <td>{{ show(item.interruption_reason) }}</td>
+                      </tr>
+                      <tr v-if="!favoriteShadowHistory.length"><td colspan="8" class="empty-row">Наблюдений пока нет</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </template>
+          </article>
+
+        </section>
+
+        <section v-if="strategyConfig.strategy_type === 'NEXT_GOAL' && (strategyConfig.team1_profile_enabled || team1Profile.enabled)" class="full-width-section observation-section">
+
+          <article class="panel observation-panel">
+            <header class="panel-header compact">
+              <div><span class="eyebrow amber">TEAM_1 PROFILE SHADOW</span><h2>Наблюдение фильтра</h2></div>
+              <span :class="['observation-state', String(team1Profile.state || 'OFF').toLowerCase()]">TEAM_1: {{ team1Profile.state || 'OFF' }}</span>
+            </header>
+
+            <div v-if="!team1Profile.enabled" class="panel-empty">Фильтр TEAM_1 + КФ выключен</div>
+            <template v-else>
+              <div v-if="team1ProfileActiveObservation" class="active-observation">
+                <div class="observation-summary">
+                  <div><span>МАТЧ</span><strong>{{ show(team1ProfileActiveObservation.match_name) }}</strong></div>
+                  <div><span>ВЫБРАНА</span><strong>{{ show(team1ProfileActiveObservation.selected_team) }}</strong><small>{{ show(team1ProfileActiveObservation.side_label) }}</small></div>
+                  <div><span>СТАРТОВЫЙ КФ</span><strong>{{ show(team1ProfileActiveObservation.initial_odds) }}</strong></div>
+                  <div><span>ПРИЧИНА НАБЛЮДЕНИЯ</span><strong>{{ show(team1ProfileActiveObservation.filter_reason) }}</strong></div>
+                  <div><span>SHADOW STEP</span><strong>{{ team1ProfileActiveObservation.shadow_step || 0 }}</strong></div>
+                  <div><span>СЧЁТ</span><strong>{{ show(team1ProfileActiveObservation.score_before) }} → {{ show(team1ProfileActiveObservation.score_after) }}</strong></div>
+                  <div><span>РЕЗУЛЬТАТ ШАГА</span><strong>{{ show(team1ProfileActiveObservation.step_result, 'WAITING') }}</strong></div>
+                  <div><span>СТАТУС</span><strong>{{ show(team1ProfileActiveObservation.status, 'OBSERVING') }}</strong></div>
+                </div>
+
+                <div class="table-wrap observation-steps">
+                  <table>
+                    <thead><tr><th>Шаг</th><th>Кф</th><th>Счёт до</th><th>Счёт после</th><th>Автор гола</th><th>Результат</th></tr></thead>
+                    <tbody>
+                      <tr v-for="stepItem in team1ProfileActiveObservation.steps || []" :key="stepItem.step">
+                        <td>{{ stepItem.step }}</td><td>{{ show(stepItem.odds) }}</td><td>{{ show(stepItem.score_before) }}</td><td>{{ show(stepItem.score_after) }}</td><td>{{ show(stepItem.scorer) }}</td><td><span :class="['table-result', String(stepItem.result).toLowerCase()]">{{ stepItem.result }}</span></td>
+                      </tr>
+                      <tr v-if="!(team1ProfileActiveObservation.steps || []).length"><td colspan="6" class="empty-row">Шаг {{ team1ProfileActiveObservation.shadow_step || 1 }} · ожидаем гол</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div v-else class="panel-empty">Нет активного наблюдения — ждём следующий матч, не прошедший профиль</div>
+
+              <div class="observation-history">
+                <h3>Последние наблюдения TEAM_1 фильтра</h3>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Матч</th><th>Выбрана</th><th>Сторона</th><th>Стартовый кф</th><th>Причина</th><th>Шаг закрытия</th><th>Завершение</th></tr></thead>
+                    <tbody>
+                      <tr v-for="item in team1ProfileObservationHistory" :key="`team1-${item.match_id}-${item.completed_at}`">
+                        <td>{{ item.match_name }}</td><td>{{ item.selected_team }}</td><td>{{ item.side_label }}</td><td>{{ show(item.initial_odds) }}</td><td>{{ show(item.filter_reason) }}</td><td>{{ item.series_length || '—' }}</td><td>{{ show(item.completion_status) }}</td>
+                      </tr>
+                      <tr v-if="!team1ProfileObservationHistory.length"><td colspan="7" class="empty-row">Завершённых наблюдений пока нет</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </template>
+          </article>
+
+        </section>
+
+        <section class="full-width-section observation-section">
+
+          <article class="panel observation-panel">
+
+            <header class="panel-header compact">
+
+              <div><span class="eyebrow amber">LONG SERIES SHADOW</span><h2>Наблюдение</h2></div>
+
+              <span :class="['observation-state', String(longSeries.state || 'OFF').toLowerCase()]">LONG_SERIES: {{ longSeries.state || 'OFF' }}</span>
+
+            </header>
+
+            <div v-if="!longSeries.enabled" class="panel-empty">LONG_SERIES выключен</div>
+
+            <template v-else>
+
+              <div v-if="activeObservation" class="active-observation">
+
+                <div class="observation-summary">
+                  <div><span>МАТЧ</span><strong>{{ show(activeObservation.match_name) }}</strong></div>
+                  <div><span>ВЫБРАНА</span><strong>{{ show(activeObservation.selected_team) }}</strong><small>{{ show(activeObservation.side_label) }}</small></div>
+                  <div><span>СТАРТОВЫЙ КФ</span><strong>{{ show(activeObservation.initial_odds) }}</strong></div>
+                  <div><span>ТЕКУЩИЙ КФ</span><strong>{{ show(activeObservation.current_odds) }}</strong></div>
+                  <div><span>SHADOW STEP</span><strong>{{ activeObservation.shadow_step || 0 }}</strong></div>
+                  <div><span>СЧЁТ</span><strong>{{ show(activeObservation.score_before) }} → {{ show(activeObservation.score_after) }}</strong></div>
+                  <div><span>РЕЗУЛЬТАТ ШАГА</span><strong>{{ show(activeObservation.step_result, 'WAITING') }}</strong></div>
+                  <div><span>СТАТУС</span><strong>{{ show(activeObservation.classification, 'OBSERVING') }}</strong></div>
+                </div>
+
+                <div class="table-wrap observation-steps">
+                  <table>
+                    <thead><tr><th>Шаг</th><th>Кф</th><th>Счёт до</th><th>Счёт после</th><th>Автор гола</th><th>Результат</th></tr></thead>
+                    <tbody>
+                      <tr v-for="stepItem in activeObservation.steps || []" :key="stepItem.step">
+                        <td>{{ stepItem.step }}</td><td>{{ show(stepItem.odds) }}</td><td>{{ show(stepItem.score_before) }}</td><td>{{ show(stepItem.score_after) }}</td><td>{{ show(stepItem.scorer) }}</td><td><span :class="['table-result', String(stepItem.result).toLowerCase()]">{{ stepItem.result }}</span></td>
+                      </tr>
+                      <tr v-if="!(activeObservation.steps || []).length"><td colspan="6" class="empty-row">Шаг {{ activeObservation.shadow_step || 1 }} · ожидаем гол</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+              </div>
+
+              <div v-else class="panel-empty">
+                {{ longSeries.state === 'NEXT_MATCH_ALLOWED' ? 'LONG обнаружен — следующий матч разрешён' : (longSeries.state === 'LIVE_MATCH_ACTIVE' ? 'Разрешённый betting match активен' : 'Нет активного наблюдения — ожидаем следующий матч') }}
+              </div>
+
+              <div class="observation-history">
+                <h3>Последние наблюдения</h3>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Матч</th><th>Команда</th><th>Сторона</th><th>Начальный кф</th><th>Длина</th><th>Результат</th><th>Завершение</th></tr></thead>
+                    <tbody>
+                      <tr v-for="item in observationHistory" :key="`${item.match_id}-${item.completed_at}`" :class="{ 'observation-long': item.classification === 'LONG' }">
+                        <td>{{ item.match_name }}</td><td>{{ item.selected_team }}</td><td>{{ item.side_label }}</td><td>{{ show(item.initial_odds) }}</td><td>{{ item.series_length }}</td><td><span :class="['table-result', String(item.classification).toLowerCase()]">{{ item.classification }}</span></td><td>{{ show(item.completion_status, item.classification === 'LONG' || item.classification === 'SHORT' ? 'COMPLETED' : '—') }}</td>
+                      </tr>
+                      <tr v-if="!observationHistory.length"><td colspan="7" class="empty-row">Завершённых наблюдений пока нет</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+            </template>
+
+          </article>
+
+        </section>
+
+        <section class="secondary-grid">
+
+          <article class="panel bet-panel">
+
+            <header class="panel-header compact">
+
+              <div>
+
+                <span class="eyebrow">VIRTUAL BET</span>
+
+                <h2>Текущая ставка</h2>
+
+              </div>
+
+              <span class="step-badge">{{ bet.step || 0 }} / {{ bet.max_steps || 7 }}</span>
+
+            </header>
+
+            <div v-if="longSeriesWaiting" class="panel-empty">Нет активной ставки · LONG_SERIES наблюдает матчи</div>
+
+            <div v-else-if="team1ProfileObserving" class="panel-empty">Нет активной ставки · TEAM_1 PROFILE наблюдает матч</div>
+
+            <div v-else class="bet-grid">
+
+              <div><span>СУММА</span><strong>{{ show(bet.amount) }} <small>RUB</small></strong></div>
+
+              <div><span>МАТЧ</span><strong>{{ show(bet.match, state.match ? `${match.team1} — ${match.team2}` : null) }}</strong></div>
+
+              <div><span>РЫНОК</span><strong>{{ show(bet.market, 'Следующий гол') }}</strong></div>
+
+              <div><span>{{ isFirstHalfDraw ? 'ВЫБОР' : 'КОМАНДА' }}</span><strong>{{ show(state.selected_team) }}</strong></div>
+
+              <div><span>СТОРОНА</span><strong>{{ show(bet.side_label) }}</strong></div>
+
+              <div><span>КОЭФФИЦИЕНТ</span><strong class="green">{{ show(bet.odds) }}</strong></div>
+
+              <div><span>СЧЁТ ПЕРЕД СТАВКОЙ</span><strong>{{ show(bet.score_before) }}</strong></div>
+
+              <div v-if="!isFirstHalfDraw"><span>НОМЕР СЛЕДУЮЩЕГО ГОЛА</span><strong>{{ show(bet.next_goal_number) }}</strong></div>
+
+              <div><span>STATUS</span><strong>{{ show(bet.status, state.status) }}</strong></div>
+
+              <div><span>ПОСЛЕДНИЙ РЕЗУЛЬТАТ</span><strong>{{ show(state.last_result, lastChange.result) }}</strong></div>
+
+            </div>
+
+          </article>
+
+          <article class="panel change-panel">
+
+            <header class="panel-header compact">
+
+              <div>
+
+                <span class="eyebrow">LAST EVENT</span>
+
+                <h2>Последнее изменение</h2>
+
+              </div>
+
+              <span
+
+                v-if="lastChange.result"
+
+                :class="['result-badge', String(lastChange.result).toLowerCase()]"
+
+              >{{ lastChange.result }}</span>
+
+            </header>
+
+            <div v-if="state.last_change" class="change-content">
+
+              <div class="score-change">
+
+                <span>{{ lastChange.before }}</span><i>→</i><strong>{{ lastChange.after }}</strong>
+
+              </div>
+
+              <div class="goal-scorer">
+
+                <span>КТО ЗАБИЛ</span>
+
+                <strong>{{ lastChange.scorer }}</strong>
+
+              </div>
+
+            </div>
+
+            <div v-else class="panel-empty">Изменений счёта пока нет</div>
+
+          </article>
+
+        </section>
+
+        <section class="match-stats-grid">
+
+          <article class="panel match-panel">
+
+            <header class="panel-header">
+
+              <div>
+
+                <span class="eyebrow">LIVE SCOREBOARD</span>
+
+                <h2>Текущий матч</h2>
+
+              </div>
+
+              <span class="timer">{{ show(match.timer) }}</span>
+
+            </header>
+
+            <div v-if="state.match" class="scoreboard">
+
+              <div class="team team-left">
+
+                <span>КОМАНДА 1</span>
+
+                <strong>{{ show(match.team1) }}</strong>
+
+              </div>
+
+              <div class="score">
+
+                <strong>{{ scoreText }}</strong>
+
+                <span>{{ show(match.state, show(match.period, 'LIVE')) }}</span>
+
+              </div>
+
+              <div class="team team-right">
+
+                <span>КОМАНДА 2</span>
+
+                <strong>{{ show(match.team2) }}</strong>
+
+              </div>
+
+            </div>
+
+            <div v-else class="panel-empty">Матч ещё не выбран</div>
+
+          </article>
+
+          <section class="stats-section">
+
+            <div class="section-heading">
+
+              <span class="eyebrow">DEMO ANALYTICS</span>
+
+              <h2>Статистика стратегии</h2>
+
+            </div>
+
+            <div class="stats-grid">
+
+              <article><span>Матчей обработано</span><strong>{{ stats.matches_processed }}</strong></article>
+
+              <article><span>Ставок сделано</span><strong>{{ stats.bets }}</strong></article>
+
+              <article><span>WIN</span><strong class="green">{{ stats.wins }}</strong></article>
+
+              <article><span>LOSE</span><strong class="red">{{ stats.losses }}</strong></article>
+
+              <article><span>Сумма demo-ставок</span><strong>{{ formatNumber(stats.total_amount) }} ₽</strong></article>
+
+              <article><span>Средний КФ</span><strong>{{ formatNumber(stats.average_odds, 3) }}</strong></article>
+
+              <article><span>Макс. шаг</span><strong>{{ stats.max_step }}</strong></article>
+
+              <article><span>Шагов до WIN</span><strong>{{ formatNumber(stats.average_steps_to_win) }}</strong></article>
+
+            </div>
+
+            <div class="table-wrap strategy-stats-table">
+
+              <table>
+
+                <thead><tr><th>Стратегия</th><th>Ставки</th><th>WIN</th><th>LOSE</th><th>Макс. шаг</th><th>P&amp;L</th><th>MARKET_LOCKED</th><th>Средняя блокировка</th></tr></thead>
+
+                <tbody>
+
+                  <tr v-for="([name, item]) in strategyComparison" :key="name">
+
+                    <td>{{ name }}</td><td>{{ item.bets || 0 }}</td><td class="green">{{ item.wins || 0 }}</td><td class="red">{{ item.losses || 0 }}</td><td>{{ item.max_step || 0 }}</td>
+
+                    <td :class="Number(item.profit_loss || 0) >= 0 ? 'green' : 'red'">{{ Number(item.profit_loss || 0) >= 0 ? '+' : '' }}{{ formatNumber(item.profit_loss || 0) }} ₽</td>
+
+                    <td>{{ item.market_locked_count || 0 }}</td><td>{{ item.average_market_locked_seconds == null ? '—' : `${formatNumber(item.average_market_locked_seconds, 3)} с` }}</td>
+
+                  </tr>
+
+                </tbody>
+
+              </table>
+
+            </div>
+
+          </section>
+
+        </section>
+
+        <section class="selection-row">
+
+          <article class="panel selection-panel">
+
+            <header class="panel-header">
+
+              <div>
+
+                <span class="eyebrow amber">СТРАТЕГИЯ</span>
+
+                <h2>{{ isFirstHalfDraw ? 'Выбранная ставка' : 'Выбранная команда' }}</h2>
+
+              </div>
+
+            </header>
+
+            <div v-if="state.selected_team" class="selection-content">
+
+              <div class="selected-team">{{ state.selected_team }}</div>
+
+              <div class="reason">
+
+                  <span>{{ isFirstHalfDraw ? 'РЫНОК' : 'ПРИЧИНА ВЫБОРА' }}</span>
+
+                <strong>{{ state.selection_reason }}</strong>
+
+              </div>
+
+              <div v-if="!isFirstHalfDraw" class="odds-compare">
+
+                <div>
+
+                  <span>{{ show(match.team1, 'TEAM 1') }}</span>
+
+                  <strong>{{ show(state.odds?.team1) }}</strong>
+
+                </div>
+
+                <div>
+
+                  <span>{{ show(match.team2, 'TEAM 2') }}</span>
+
+                  <strong>{{ show(state.odds?.team2) }}</strong>
+
+                </div>
+
+              </div>
+
+              <div class="selection-details">
+
+                <span>{{ isFirstHalfDraw ? 'Выбор: Ничья' : (state.selected_side === 'TEAM_1' ? 'Команда 1 / левая' : 'Команда 2 / правая') }}</span>
+
+                <span>КФ при выборе: {{ show(state.initial_selected_odds) }}</span>
+
+                <span>Шаг: {{ bet.step || 1 }} / {{ bet.max_steps || 7 }}</span>
+
+                <span>Ставка: {{ show(bet.amount, 20) }} ₽</span>
+
+              </div>
+
+              <div class="selection-proof">{{ isFirstHalfDraw ? 'Результат определяется только по финальному счёту 1-го тайма' : 'Команда зафиксирована по большему начальному КФ' }}</div>
+
+            </div>
+
+            <div v-else-if="state.odds?.team1 != null || state.odds?.team2 != null" class="selection-content">
+
+              <div class="selected-team">Коэффициенты рынка</div>
+
+              <div class="odds-compare">
+
+                <div>
+
+                  <span>{{ show(match.team1, 'TEAM 1') }}</span>
+
+                  <strong>{{ show(state.odds?.team1) }}</strong>
+
+                </div>
+
+                <div>
+
+                  <span>{{ show(match.team2, 'TEAM 2') }}</span>
+
+                  <strong>{{ show(state.odds?.team2) }}</strong>
+
+                </div>
+
+              </div>
+
+              <div class="selection-proof">Коэффициенты распознаны; бот проверяет выбор команды</div>
+
+            </div>
+
+            <div v-else class="panel-empty">Ожидаем коэффициенты рынка</div>
+
+            <div
+              v-if="couponRecoveryVisible && couponRecoveryView"
+              :class="['coupon-recovery-card', `coupon-recovery-${couponRecoveryView.tone}`]"
+            >
+              <div class="coupon-recovery-head">
+                <span class="coupon-recovery-icon">{{ couponRecoveryView.icon }}</span>
+                <div>
+                  <span class="coupon-recovery-eyebrow">RECOVERY ТЕКУЩЕГО ШАГА</span>
+                  <strong>{{ couponRecoveryView.label }}</strong>
+                </div>
+              </div>
+
+              <p>{{ couponRecovery.message || couponRecoveryView.description }}</p>
+
+              <div class="coupon-recovery-grid">
+                <div>
+                  <span>ШАГ</span>
+                  <strong>{{ show(couponRecovery.step, bet.step) }}</strong>
+                </div>
+                <div>
+                  <span>КОМАНДА</span>
+                  <strong>{{ show(couponRecovery.selected_team, state.selected_team) }}</strong>
+                </div>
+                <div>
+                  <span>СУММА</span>
+                  <strong>{{ show(couponRecovery.amount, bet.amount) }} ₽</strong>
+                </div>
+                <div>
+                  <span>СЧЁТ</span>
+                  <strong>
+                    {{ show(couponRecovery.score_before, bet.score_before) }}
+                    <template v-if="couponRecovery.score_after && couponRecovery.score_after !== couponRecovery.score_before">
+                      → {{ couponRecovery.score_after }}
+                    </template>
+                  </strong>
+                </div>
+              </div>
+
+              <div class="coupon-recovery-invariants">
+                <span>✓ тот же матч</span>
+                <span>✓ та же команда</span>
+                <span>✓ тот же шаг</span>
+                <span v-if="couponRecovery.cleanup_cycle">цикл очистки: {{ couponRecovery.cleanup_cycle }}</span>
+              </div>
+            </div>
+
+            <div class="ocr-meta">
+
+              <div>
+
+                <span>РЫНОК</span>
+
+                <strong>{{ show(state.odds?.market, bet.market) }}</strong>
+
+              </div>
+
+              <div>
+
+                <span>ИСТОЧНИК</span>
+
+                <strong>{{ show(marketSource, 'Ожидаем данные') }}</strong>
+
+              </div>
+
+              <div>
+
+                <span>СТАТУС РЫНКА</span>
+
+                <strong>{{ show(marketReader.status, state.odds?.status) }}</strong>
+
+              </div>
+
+              <div v-if="marketBackend || marketConfidence">
+
+                <span>CANVAS 2D READER</span>
+
+                <strong>{{ show(marketBackend, 'fillText') }}<template v-if="marketConfidence"> · {{ marketConfidence }}</template></strong>
+
+              </div>
+
+              <div v-if="!isFirstHalfDraw">
+
+                <span>СЛЕДУЮЩИЙ ГОЛ</span>
+
+                <strong>№{{ show(marketReader.next_goal_number, bet.next_goal_number) }}</strong>
+
+              </div>
+
+              <div class="ocr-status">
+
+                <span>ЧТЕНИЕ</span>
+
+                <strong>{{ show(marketSource, 'WAITING') }} · попытка {{ marketReader.attempt || 0 }}</strong>
+
+                <small>{{ marketReadDescription }}</small>
+
+              </div>
+
+            </div>
+
+          </article>
+
+
+        </section>
+
+        <section class="budget-section">
+
+          <article>
+
+            <span>НАЧАЛЬНЫЙ БЮДЖЕТ</span>
+
+            <strong>{{ formatNumber(budget.initial_budget) }} ₽</strong>
+
+          </article>
+
+          <article>
+
+            <span>ТЕКУЩИЙ БЮДЖЕТ</span>
+
+            <strong>{{ formatNumber(budget.current_budget) }} ₽</strong>
+
+          </article>
+
+          <article>
+
+            <span>РЕЗУЛЬТАТ СЕССИИ</span>
+
+            <strong :class="profitTone">{{ signedProfit }} ₽</strong>
+
+          </article>
+
+          <article>
+
+            <span>P&L ТЕКУЩЕЙ СЕРИИ · ШАГ {{ sequence.current_step || 1 }}</span>
+
+            <strong :class="Number(sequence.cumulative_pnl || 0) >= 0 ? 'green' : 'red'">{{ Number(sequence.cumulative_pnl || 0) >= 0 ? '+' : '' }}{{ formatNumber(sequence.cumulative_pnl || 0) }} ₽</strong>
+
+          </article>
+
+          <article>
+
+            <span>ПОСЛЕДНИЙ РЕЗУЛЬТАТ</span>
+
+            <strong>{{ show(state.last_result, lastChange.result) }}</strong>
+
+          </article>
+
+        </section>
+
+        <section class="full-width-section history-section">
+
+          <article class="panel history-panel">
+
+            <header class="panel-header compact">
+
+              <div>
+
+                <span class="eyebrow">BET JOURNAL</span>
+
+                <h2>История ставок</h2>
+
+              </div>
+
+              <div class="history-actions">
+
+                <button class="button" :disabled="!canClearHistory" @click="clearHistory">
+
+                  {{ pendingAction === 'clear-history' ? 'Очищение...' : 'Очистить историю ставок' }}
+
+                </button>
+
+                <span class="counter">{{ history.length }}</span>
+
+              </div>
+
+            </header>
+
+            <div class="table-wrap">
+
+              <table>
+
+                <thead>
+
+                  <tr>
+
+                    <th>№</th><th>Стратегия</th><th>Матч</th><th>Выбор</th><th>Ставка</th><th>КФ</th>
+
+                    <th>Шаг</th><th>Счёт до</th><th>Счёт после</th><th>Кто забил</th><th>Результат</th>
+
+                    <th>Бюджет до</th><th>Изменение</th><th>Бюджет после</th>
+
+                  </tr>
+
+                </thead>
+
+                <tbody>
+
+                  <tr v-for="(item, index) in reversedHistory" :key="item.id || `${item.cycle_id}-${item.step}`">
+
+                    <td>{{ history.length - index }}</td>
+
+                    <td>{{ item.strategy_name || strategyPresentation[item.strategy_type]?.name || 'Следующий гол' }}</td>
+
+                    <td>{{ item.match }}</td>
+
+                    <td>{{ item.selected_team }}</td>
+
+                    <td>{{ item.amount }} ₽</td>
+
+                    <td>{{ item.odds }}</td>
+
+                    <td>{{ item.step }}</td>
+
+                    <td>{{ item.score_before }}</td>
+
+                    <td>{{ show(item.score_after) }}</td>
+
+                    <td>{{ show(item.scorer) }}</td>
+
+                    <td><span :class="['table-result', String(item.result).toLowerCase()]">{{ item.result === 'MISSED_SELECTED_TEAM_GOAL' ? 'ПРОПУЩЕН ГОЛ' : (item.result === 'BLOCKED' ? 'Блокировка' : item.result) }}</span></td>
+
+                    <td>{{ formatNumber(item.budget_before) }} ₽</td>
+
+                    <td :class="Number(item.budget_change) >= 0 ? 'green' : 'red'">
+
+                      {{ item.budget_change === null || item.budget_change === undefined ? '—' : `${Number(item.budget_change) >= 0 ? '+' : ''}${formatNumber(item.budget_change)} ₽` }}
+
+                    </td>
+
+                    <td>{{ item.budget_after === null || item.budget_after === undefined ? '—' : `${formatNumber(item.budget_after)} ₽` }}</td>
+
+                  </tr>
+
+                  <tr v-if="!history.length"><td colspan="14" class="empty-row">Виртуальных ставок пока нет</td></tr>
+
+                </tbody>
+
+              </table>
+
+            </div>
+
+          </article>
+
+        </section>
+
+        <section class="full-width-section live-log-section">
+
+          <article class="panel log-panel">
+
+            <header class="panel-header compact">
+
+              <div>
+
+                <span class="eyebrow">LIVE STREAM</span>
+
+                <h2>Живой лог</h2>
+
+              </div>
+
+              <span class="live-indicator"><i /> LIVE</span>
+
+            </header>
+
+            <div class="logs">
+
+              <div
+                v-for="(item, index) in recentLogs"
+                :key="`${item.timestamp}-${index}`"
+                :class="[
+                  'log-row',
+                  {
+                    'log-row-bookmaker-lock': isBookmakerLockLog(item) && !isBookmakerUnlockLog(item) && !isBookmakerGoalDuringLockLog(item),
+                    'log-row-bookmaker-unlock': isBookmakerUnlockLog(item),
+                    'log-row-bookmaker-goal-lock': isBookmakerGoalDuringLockLog(item),
+                  },
+                ]"
+              >
+
+                <time>{{ item.time }}</time>
+
+                <span class="log-event">{{ bookmakerLogLabel(item) }}</span>
+
+                <p>{{ item.message }}</p>
+
+              </div>
+
+              <div v-if="!logs.length" class="panel-empty">Лог появится после запуска DEMO</div>
+
+            </div>
+
+          </article>
+
+        </section>
+
+      </template>
+
+    </main>
+
+  </div>
+
+</template>

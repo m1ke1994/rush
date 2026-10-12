@@ -1,0 +1,30 @@
+
+!.env.example
+# Browser / Playwright profile
+# Diagnostics
+# Frontend
+# Logs
+# Python cache
+# Secrets / local configuration
+# Virtual environments
+*.log
+*.pyc
+*.pyo
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+backend/data/
+backend/data/*.jsonl
+backend/data/*.sqlite3
+backend/data/*.sqlite3-*
+backend/diagnostics/canvas/*.json
+backend/diagnostics/canvas/*.png
+backend/diagnostics/canvas/latest_analysis.json
+browser_profile/
+browser_profile_cdp/
+dist/
+node_modules/
+venv/

@@ -1,0 +1,281 @@
+import asyncio
+import re
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from playwright.async_api import Page
+
+from backend.app.browser.navigation import goto_with_retry
+from xbet_config import SELECTORS, TEXTS, URL_CONFIG
+
+
+SITE_URL = URL_CONFIG.login_url
+# Configured selector stays first, while the confirmed current/legacy header
+# layouts are kept as fallbacks so a bookmaker wrapper rename does not cost a
+# 40-second auth timeout.
+BALANCE_SELECTOR = SELECTORS.auth_marker
+BALANCE_CURRENCY = TEXTS.auth_marker
+AUTH_SELECTOR_CANDIDATES = tuple(
+    dict.fromkeys(
+        selector
+        for selector in (
+            BALANCE_SELECTOR,
+            *SELECTORS.auth_marker_fallbacks,
+        )
+        if selector
+    )
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+PROFILE_DIR = BASE_DIR / "browser_profile"
+
+PAGE_TIMEOUT = 30_000
+# Auth is checked frequently because this is only a tiny DOM lookup. The old
+# 2-second poll could unnecessarily stall an already-authorized session.
+MANUAL_LOGIN_POLL_INTERVAL = 0.25
+MANUAL_LOGIN_TIMEOUT = 40.0
+# There is no reason to sleep for 25 seconds after RUB has already been found.
+AUTHORIZED_CONTINUE_DELAY = 0.0
+
+WaitingCallback = Callable[[], Awaitable[None]]
+
+
+def log(message: str) -> None:
+    print(f"[AUTH] {message}")
+
+
+def _contains_currency(text: str | None, currency: str = BALANCE_CURRENCY) -> bool:
+    if not text or not currency:
+        return False
+    # inner_text() usually returns "RUB\n9.13", while text_content() can return
+    # "RUB9.13". A word-boundary match safely handles both representations.
+    return bool(re.search(rf"(?<![A-Za-zА-Яа-я0-9]){re.escape(currency)}(?![A-Za-zА-Яа-я0-9])", text.strip()))
+
+
+async def check_balance(page: Page) -> bool:
+    """Confirm authorization by the balance header containing exact RUB text."""
+    for selector in AUTH_SELECTOR_CANDIDATES:
+        try:
+            candidates = page.locator(selector)
+            count = await candidates.count()
+        except Exception:
+            continue
+
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                text = await candidate.inner_text()
+            except Exception:
+                try:
+                    text = await candidate.text_content()
+                except Exception:
+                    text = None
+            if _contains_currency(text):
+                return True
+
+            # Current layout keeps RUB in a nested ui-caption span inside the
+            # balance currency container. This avoids depending on balance value.
+            try:
+                if await candidate.get_by_text(BALANCE_CURRENCY, exact=True).count():
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+async def _site_document_is_usable(page: Page, url: str) -> bool:
+    """Return True when the persistent tab is already on the configured site."""
+    try:
+        if page.is_closed():
+            return False
+        current = urlparse(str(page.url or ""))
+        target = urlparse(url)
+        if not current.scheme or current.scheme == "about":
+            return False
+        if target.netloc and current.netloc.lower() != target.netloc.lower():
+            return False
+        state = await page.evaluate(
+            """() => ({
+                readyState: document.readyState,
+                hasBody: Boolean(document.body),
+                href: String(location.href || ''),
+                title: String(document.title || ''),
+                bodyText: String(document.body?.innerText || '').slice(0, 4000),
+                loadEventEnd: Number(
+                    performance.getEntriesByType('navigation')[0]?.loadEventEnd || 0
+                ),
+            })"""
+        )
+    except Exception:
+        return False
+
+    if not isinstance(state, dict):
+        return False
+    href = str(state.get("href") or "")
+    diagnostic_text = " ".join(
+        (
+            href,
+            str(state.get("title") or ""),
+            str(state.get("bodyText") or ""),
+        )
+    ).upper()
+    if href.lower().startswith("chrome-error://"):
+        return False
+    if any(
+        marker in diagnostic_text
+        for marker in (
+            "ERR_NETWORK_CHANGED",
+            "ERR_INTERNET_DISCONNECTED",
+            "ERR_CONNECTION_RESET",
+            "ERR_CONNECTION_CLOSED",
+            "ERR_CONNECTION_REFUSED",
+            "ERR_NAME_NOT_RESOLVED",
+            "ERR_TIMED_OUT",
+            "ERR_PROXY_CONNECTION_FAILED",
+        )
+    ):
+        return False
+
+    # Reuse only a fully finished document. "interactive" is intentionally
+    # rejected here: 1xBet is a heavy SPA and can still be loading the bundles
+    # that hydrate the shell. Reusing it too early was one cause of the
+    # permanently half-loaded Playwright tab.
+    return bool(
+        state.get("hasBody")
+        and state.get("readyState") == "complete"
+        and float(state.get("loadEventEnd") or 0) > 0
+    )
+
+
+async def open_site(page: Page, url: str = SITE_URL) -> None:
+    """Open the configured site once and reuse an already usable persistent tab."""
+    if not url:
+        raise RuntimeError("XBET_URL отсутствует в .env")
+
+    if await _site_document_is_usable(page, url):
+        log(f"Сайт уже открыт: {page.url}")
+        return
+
+    log(f"Открываем сайт: {url}")
+    await goto_with_retry(
+        page,
+        url,
+        timeout_ms=PAGE_TIMEOUT,
+        attempts=1,
+        logger=log,
+    )
+    # Startup performs one deliberate navigation request. BrowserManager owns
+    # the only cooldown retry so connection resets do not create a request storm.
+    log("DOM сайта загружен")
+
+
+async def _wait_poll_interval(
+    stop_event: asyncio.Event | None,
+    timeout: float,
+) -> bool:
+    """Wait for the next check and return False when a stop was requested."""
+    if timeout <= 0:
+        return stop_event is None or not stop_event.is_set()
+    if stop_event is None:
+        await asyncio.sleep(timeout)
+        return True
+
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+    except TimeoutError:
+        return True
+    return False
+
+
+async def wait_for_manual_login(
+    page: Page,
+    stop_event: asyncio.Event | None = None,
+    on_authorized: WaitingCallback | None = None,
+) -> dict[str, Any]:
+    """Observe RUB for at most 40 seconds without touching the login form."""
+    started_at = asyncio.get_running_loop().time()
+
+    while asyncio.get_running_loop().time() - started_at < MANUAL_LOGIN_TIMEOUT:
+        if stop_event is not None and stop_event.is_set():
+            return {"ok": False, "status": "AUTH_STOPPED"}
+
+        if page.is_closed():
+            raise RuntimeError("Страница Chromium была закрыта во время ручного входа")
+
+        if await check_balance(page):
+            log("Обнаружен баланс RUB")
+            log("Авторизация подтверждена")
+            if on_authorized is not None:
+                await on_authorized()
+            log("Продолжаем работу программы без дополнительной задержки")
+            return {"ok": True, "status": "AUTHORIZED"}
+
+        elapsed = asyncio.get_running_loop().time() - started_at
+        remaining = MANUAL_LOGIN_TIMEOUT - elapsed
+        if remaining <= 0:
+            break
+        if not await _wait_poll_interval(
+            stop_event,
+            min(MANUAL_LOGIN_POLL_INTERVAL, remaining),
+        ):
+            break
+
+    if stop_event is not None and stop_event.is_set():
+        return {"ok": False, "status": "AUTH_STOPPED"}
+
+    log("Таймаут ожидания ручной авторизации: 40 секунд")
+    log("RUB не обнаружен")
+    log("Продолжаем выполнение программы")
+    return {"ok": True, "status": "AUTH_TIMEOUT"}
+
+
+async def authorize(
+    page: Page,
+    stop_event: asyncio.Event | None = None,
+    on_waiting: WaitingCallback | None = None,
+    on_authorized: WaitingCallback | None = None,
+) -> dict[str, Any]:
+    """Open XBET_URL and apply the bounded manual-authorization flow."""
+    await open_site(page)
+    log("Проверяем авторизацию")
+
+    if await check_balance(page):
+        log("Найден баланс RUB")
+        log("Пользователь авторизован")
+        if on_authorized is not None:
+            await on_authorized()
+        if AUTHORIZED_CONTINUE_DELAY > 0:
+            if not await _wait_poll_interval(stop_event, AUTHORIZED_CONTINUE_DELAY):
+                return {"ok": False, "status": "AUTH_STOPPED"}
+        log("Продолжаем работу программы без дополнительной задержки")
+        return {"ok": True, "status": "AUTHORIZED"}
+
+    log("RUB не найден")
+    log("Ожидаем ручную авторизацию, максимум 40 секунд")
+    if on_waiting is not None:
+        await on_waiting()
+
+    return await wait_for_manual_login(page, stop_event, on_authorized)
+
+
+async def main() -> None:
+    from backend.app.browser.manager import BROWSER_MANAGER
+
+    page = await BROWSER_MANAGER.start()
+    try:
+        result = await authorize(page)
+        print(result)
+        if result.get("status") == "AUTHORIZED":
+            print("Авторизация выполнена. Нажмите ENTER для завершения.")
+            await asyncio.to_thread(input)
+        elif result.get("status") == "AUTH_TIMEOUT":
+            print("Ожидание авторизации завершено. Нажмите ENTER для завершения.")
+            await asyncio.to_thread(input)
+    finally:
+        await BROWSER_MANAGER.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
