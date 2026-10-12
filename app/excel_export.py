@@ -60,6 +60,8 @@ def workbook(storage):
         ["Источник", "Локальная SQLite база Rush"],
         ["Принцип", "Каждая исходная запись сохраняется без дедупликации"],
         ["Ограничение", "Пропущенные события/коэффициенты не восстанавливаются искусственно"],
+        ["Счёт на выходе", "Последний наблюдавшийся счёт; может отличаться от финального"],
+        ["Второй тайм на выходе", "Счёт на выходе минус зафиксированный первый тайм; частичный, пока нет финала"],
         ["Турнирная таблица", "Вычислена из подтверждённых итогов независимо от полноты голов; не официальная таблица БК"],
         ["Дата и время", "Все исходные временные метки сохранены строками, как в SQLite"],
         ["Ограничение Excel", "Текст в одной ячейке ограничен 32767 символами; полная запись сохраняется в SQLite"],
@@ -68,7 +70,8 @@ def workbook(storage):
     match_columns = [
         "id", "external_match_id", "league", "team_1", "team_2",
         "scheduled_at", "started_at", "finished_at", "match_url", "first_half_score",
-        "second_half_score", "final_score", "winner", "total_goals",
+        "last_observed_score", "last_observed_time", "last_observed_at",
+        "second_half_observed_score", "second_half_score", "final_score", "winner", "total_goals",
         "status", "data_complete", "created_at",
     ]
     goal_columns = [
@@ -122,14 +125,16 @@ def workbook(storage):
 
     add_sheet(book, "Матчи_для_анализа", [
         "ID матча", "Начало UTC", "Команда 1", "Команда 2",
-        "1-й тайм", "2-й тайм", "Итог", "Победитель", "Статус",
+        "1-й тайм", "2-й тайм на выходе", "Счёт на выходе", "Время выхода", "Время фиксации UTC",
+        "2-й тайм (финал)", "Подтверждённый итог", "Победитель", "Статус",
         "Полная история", "Голы по порядку", "Счёт по порядку",
         "Записанных голов", "Снимков КФ", "Событий",
     ], (
         [
             m["external_match_id"], m.get("started_at"), m["team_1"], m["team_2"],
-            m.get("first_half_score"), m.get("second_half_score"),
-            m.get("final_score"), m.get("winner"), m["status"],
+            m.get("first_half_score"), m.get("second_half_observed_score"),
+            m.get("last_observed_score"), m.get("last_observed_time"), m.get("last_observed_at"),
+            m.get("second_half_score"), m.get("final_score"), m.get("winner"), m["status"],
             bool(m.get("data_complete")),
             " → ".join(str(g.get("team") or "?") for g in goals_by[m["id"]]),
             " → ".join(str(g.get("score_after") or "?") for g in goals_by[m["id"]]),
