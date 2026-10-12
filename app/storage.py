@@ -131,3 +131,29 @@ class Storage:
             match = con.execute("SELECT * FROM matches WHERE id=?", (match_id,)).fetchone()
             if not match: return None
             return {"match":dict(match), "goals":[dict(x) for x in con.execute("SELECT * FROM goal_events WHERE match_id=? ORDER BY goal_number",(match_id,))], "odds":[dict(x) for x in con.execute("SELECT * FROM odds_snapshots WHERE match_id=? ORDER BY id",(match_id,))]}
+
+    def calculated_standings(self):
+        """Derived standings from fully observed finished matches only.
+        This is not the official bookmaker standings."""
+        with self.connection() as con:
+            fixtures=[dict(r) for r in con.execute(
+                "SELECT id,team_1,team_2,final_score,finished_at FROM matches "
+                "WHERE status='FINISHED' AND final_score IS NOT NULL AND data_complete=1 "
+                "ORDER BY COALESCE(finished_at,created_at),id")]
+        stats={}
+        for m in fixtures:
+            try:
+                a,b=(int(x) for x in m['final_score'].split(':'))
+            except (ValueError,AttributeError):
+                continue
+            for team,goals,against in ((m['team_1'],a,b),(m['team_2'],b,a)):
+                row=stats.setdefault(team,{'team':team,'played':0,'wins':0,'draws':0,'losses':0,'goals_for':0,'goals_against':0,'points':0})
+                row['played']+=1; row['goals_for']+=goals; row['goals_against']+=against
+                if goals>against: row['wins']+=1; row['points']+=3
+                elif goals==against: row['draws']+=1; row['points']+=1
+                else: row['losses']+=1
+        table=sorted(stats.values(),key=lambda r:(-r['points'],-(r['goals_for']-r['goals_against']),-r['goals_for'],r['team']))
+        for index,row in enumerate(table,1):
+            row['position']=index
+            row['goal_difference']=row['goals_for']-row['goals_against']
+        return {'source':'LOCAL_FINISHED_COMPLETE_ONLY','matches_count':len(fixtures),'table':table}
