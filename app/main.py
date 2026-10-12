@@ -31,6 +31,8 @@ async def start():
 async def stop():
     await collector.stop()
     return {"stopped": True, "message": "Наблюдение остановлено"}
+@app.get("/api/standings")
+def standings(): return storage.calculated_standings()
 @app.get("/api/matches")
 def matches(): return storage.list_matches()
 @app.get("/api/matches/{match_id}")
