@@ -118,6 +118,11 @@ class FinalResultReconciler:
                         url=safe_match_url(match,self.league_url)
                         try:
                             await tab.goto(url,wait_until="domcontentloaded",timeout=10000)
+                            # Redirects may silently open another fixture. Never
+                            # write that score to the originally requested ID.
+                            if not urlparse(tab.url).path.rsplit("/",1)[-1].startswith(str(match["external_match_id"])+"-"):
+                                self.log(f"Финал не подтверждён: сайт перенаправил матч {match['external_match_id']}.")
+                                continue
                             result=await read_verified_final(tab,self.selectors,self.scoreboard_reader)
                             if result and self.storage.finalize_observed_match(identifier,result,source="VERIFIED_MATCH_PAGE"):
                                 self._attempts.pop(identifier,None)
