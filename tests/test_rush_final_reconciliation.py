@@ -2,6 +2,7 @@
 import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from contextlib import closing
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -38,7 +39,7 @@ def test_legacy_db_migrates_without_losing_existing_rows():
     import sqlite3
     with TemporaryDirectory() as folder:
         path=Path(folder)/"legacy.sqlite"
-        with sqlite3.connect(path) as con:
+        with closing(sqlite3.connect(path)) as con:
             con.execute("""CREATE TABLE matches (
                 id INTEGER PRIMARY KEY, external_match_id TEXT NOT NULL UNIQUE,
                 league TEXT NOT NULL, team_1 TEXT NOT NULL, team_2 TEXT NOT NULL,
@@ -47,6 +48,7 @@ def test_legacy_db_migrates_without_losing_existing_rows():
                 status TEXT NOT NULL,data_complete INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL)""")
             con.execute("INSERT INTO matches(external_match_id,league,team_1,team_2,status,created_at) VALUES('old','rush','A','B','LIVE','2026-10-12')")
+            con.commit()
         db=Storage(path)
         assert db.list_matches()[0]["external_match_id"]=="old"
         assert "match_url" in db.list_matches()[0]
