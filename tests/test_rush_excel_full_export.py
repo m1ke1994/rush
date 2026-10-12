@@ -49,6 +49,6 @@ def test_empty_export_is_still_valid_xlsx():
         book = load_workbook(BytesIO(workbook(store)), read_only=True)
         try:
             assert book["Матчи_исходные"].max_row == 1
-            assert book["О выгрузке"]["B2"].value == 0
+            assert book["О выгрузке"]["B3"].value == 0
         finally:
             book.close()
