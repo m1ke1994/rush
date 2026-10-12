@@ -100,7 +100,7 @@ class Collector:
         # We never wait for the previous match to finish once a previously upcoming match starts.
         monitor=await page.context.new_page()
         last_monitor=0.0
-        last_odds_score=None; scoreboard_failures=0; odds_task=None
+        last_odds_score=None; scoreboard_failures=0; odds_task=None; last_odds_attempt=0.0
         try:
             await monitor.goto(__import__('xbet_config').URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=20000)
         except Exception as exc:
@@ -165,8 +165,11 @@ class Collector:
                 return
             # Reading Canvas/search may take >5s. It must not block scoreboard
             # observations or the 06:50 handover.
-            if last_odds_score != score:
+            current_time=asyncio.get_running_loop().time()
+            retry_due=(odds_task is not None and odds_task.done() and current_time-last_odds_attempt>=12 and self.runtime.current_match.get('market_status')!='AVAILABLE')
+            if last_odds_score != score or retry_due:
                 last_odds_score=score
+                last_odds_attempt=current_time
                 if odds_task is not None and not odds_task.done():
                     odds_task.cancel()
                 odds_task=asyncio.create_task(
