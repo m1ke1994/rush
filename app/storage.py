@@ -62,8 +62,15 @@ class Storage:
             ''')
             # Additive migration: existing Rush databases and all observations stay intact.
             columns={row["name"] for row in con.execute("PRAGMA table_info(matches)")}
-            if "match_url" not in columns:
-                con.execute("ALTER TABLE matches ADD COLUMN match_url TEXT")
+            for column, sql_type in (
+                ("match_url","TEXT"),
+                ("last_observed_score","TEXT"),
+                ("last_observed_time","TEXT"),
+                ("last_observed_at","TEXT"),
+                ("second_half_observed_score","TEXT"),
+            ):
+                if column not in columns:
+                    con.execute(f"ALTER TABLE matches ADD COLUMN {column} {sql_type}")
 
     def upsert_match(self, external_id, league, team1, team2, status="UPCOMING", scheduled_at=None, match_url=None):
         with self.connection() as con:
@@ -188,6 +195,47 @@ class Storage:
             for table in ("goal_events", "odds_snapshots", "match_events", "matches"):
                 con.execute(f"DELETE FROM {table}")
             return counts
+
+    @staticmethod
+    def half_difference(first, total):
+        """Return second-half goals; unknown or inconsistent counts stay unknown."""
+        import re
+        if not first or not total:
+            return None
+        if not re.fullmatch(r"\\d+:\\d+",str(first)) or not re.fullmatch(r"\\d+:\\d+",str(total)):
+            return None
+        a,b=map(int,first.split(":"))
+        x,y=map(int,total.split(":"))
+        return f"{x-a}:{y-b}" if x>=a and y>=b else None
+
+    def record_score_snapshot(self, match_id, score, game_time=None, *, source="SCOREBOARD"):
+        """Record latest confirmed observation without pretending it is final."""
+        import re
+        if not re.fullmatch(r"\\d+:\\d+",str(score)):
+            raise ValueError("Неверный формат счёта")
+        with self.connection() as con:
+            match=con.execute("SELECT first_half_score,status FROM matches WHERE id=?",(match_id,)).fetchone()
+            if not match or match["status"]=="FINISHED":
+                return False
+            derived=self.half_difference(match["first_half_score"],score)
+            con.execute("""UPDATE matches SET last_observed_score=?,
+                last_observed_time=?,last_observed_at=?,second_half_observed_score=?
+                WHERE id=? AND status!='FINISHED'""",
+                (score,game_time,now(),derived,match_id))
+        return True
+
+    def set_first_half_score(self, match_id, score):
+        """Capture halftime and recompute already known partial second-half score."""
+        with self.connection() as con:
+            row=con.execute("SELECT last_observed_score,first_half_score FROM matches WHERE id=?",(match_id,)).fetchone()
+            if not row: return False
+            # Do not erase a known halftime result.
+            if row["first_half_score"] and row["first_half_score"]!=score:
+                return False
+            con.execute("""UPDATE matches SET first_half_score=?,
+                second_half_observed_score=? WHERE id=?""",
+                (score,self.half_difference(score,row["last_observed_score"]),match_id))
+        return True
 
     def attach_match_url(self, external_id, url):
         """Add a known canonical URL without changing the match status."""
