@@ -22,6 +22,8 @@ def parse_time_to_seconds(value):
 def classify_match(period, time, score_1, score_2, live_marker=False):
     """Never mistake a nonzero score for a confirmed LIVE timer."""
     period = (period or "").strip().lower()
+    if CLOCK.fullmatch(period):
+        period = ""
     if any(mark in period for mark in FINISHED):
         return "FINISHED"
     if any(mark in period for mark in LIVE_PERIOD) or live_marker:
@@ -86,6 +88,8 @@ async def collect_league_matches(page, logger=None):
                 '.dashboard-game-info__period',
                 '[data-test="betting-dashboard-game-info"] .ui-caption',
             ))
+            if period and CLOCK.fullmatch(period.strip()):
+                period = None
             live = bool(await card.locator('.dashboard-game-action-bar[islive="true"], [islive="true"]').count())
             state = classify_match(period, time, score_1, score_2, live)
             match = MATCH_ID.search(href or "")
