@@ -17,7 +17,7 @@ class Runtime:
 
 class Collector:
     def __init__(self, storage):
-        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None
+        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set()
     def snapshot(self): return asdict(self.runtime)
     def log(self, text):
         item={"time":datetime.now().strftime("%H:%M:%S"),"message":text}; self.runtime.logs=(self.runtime.logs+[item])[-120:]; print(f"[{item['time']}] {text}")
@@ -50,7 +50,7 @@ class Collector:
             while not self.stop_event.is_set():
                 self.runtime.stage="Поиск ближайшего матча"; self.runtime.league="Переход в FC 26. 5x5 Rush"
                 await page.goto(URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=30000); self.runtime.league="Лига подключена"
-                matches=await collect_league_matches(page,self.log); item,reason=select_match(matches); self.log(f"Причина выбора: {reason}.")
+                matches=await collect_league_matches(page,self.log); self.upcoming_ids={str(m['match_id']) for m in matches if not m['is_live'] and m.get('match_id')}; item,reason=select_match(matches); self.log(f"Причина выбора: {reason}.")
                 if not item: self.runtime.stage="Ожидание ближайшего матча"; await self.wait(3); continue
                 self.log(f"Выбран матч: {item.get('team_1')} — {item.get('team_2')}.")
                 try:
@@ -71,6 +71,15 @@ class Collector:
         external=str(item.get('match_id') or item.get('href') or page.url)
         mid=self.storage.upsert_match(external,LEAGUE_NAME,item.get('team_1') or 'Не определено',item.get('team_2') or 'Не определено','LIVE' if item.get('is_live') else 'UPCOMING',item.get('game_time'))
         tracker=None; first_half=None; self.runtime.stage="Ожидание начала матча"
+        # A separate tab monitors the league while the main tab reads the active scoreboard.
+        # We never wait for the previous match to finish once a previously upcoming match starts.
+        monitor=await page.context.new_page()
+        last_monitor=0.0
+        last_odds_score=None
+        try:
+            await monitor.goto(__import__('xbet_config').URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=20000)
+        except Exception as exc:
+            self.log(f"Фоновый монитор лиги недоступен: {exc}")
         while not self.stop_event.is_set():
             try: board=await read_scoreboard(page)
             except score_error as exc: self.runtime.stage="Ожидание данных scoreboard"; self.log(f"Scoreboard временно недоступен: {exc}"); await self.wait(.7); continue
@@ -93,7 +102,10 @@ class Collector:
                 self.log(f"Матч начался/подключён: {board.team1} — {board.team2}. Счёт {score_text(score)}.")
             self.runtime.stage="Наблюдение выполняется"; self.runtime.current_match={'id':mid,'team1':board.team1,'team2':board.team2,'score':score_text(score),'half':period,'half_reason':period_reason,'time':game_time,'next_goal':sum(score)+1}
             self.storage.set_match(mid,team_1=board.team1,team_2=board.team2)
-            await self.store_odds(page,mid,score,board.team1,board.team2,read_odds)
+            # Read odds once per score change, not every 0.5 seconds.
+            if last_odds_score != score:
+                last_odds_score=score
+                await self.store_odds(page,mid,score,board.team1,board.team2,read_odds)
             for kind,team,confidence,before in tracker.transition(Observation(score,period,board.timer)):
                 if kind=='GOAL':
                     scorer=board.team1 if team==1 else board.team2; self.storage.goal(mid,sum(score),scorer,score_text(before),score_text(score),self.half(period),game_time or None,confidence); self.log(f"Гол команды {scorer}. Счёт {score_text(score)}.")
@@ -103,7 +115,33 @@ class Collector:
             if first_half is None and any(x in low for x in ('перерыв','half time','тайм заверш')):
                 first_half=score; self.storage.set_match(mid,first_half_score=score_text(score)); self.log(f"Первый тайм завершён: {score_text(score)}.")
             if await self.finished(page,scoreboard_status,selectors):
-                self.finish(mid,score,first_half,board.team1,board.team2); self.log(f"Матч завершён. Итоговый счёт {score_text(score)}."); self.runtime.current_match=None; return
+                self.finish(mid,score,first_half,board.team1,board.team2); self.log(f"Матч завершён. Итоговый счёт {score_text(score)}."); self.runtime.current_match=None; await monitor.close(); return
+            # Timer/score on the league cards is a fallback; never treat a completed
+            # old match as a newly started match.
+            loop_time=asyncio.get_running_loop().time()
+            if loop_time-last_monitor>=2.0:
+                last_monitor=loop_time
+                try:
+                    await monitor.reload(wait_until='domcontentloaded',timeout=6500)
+                    all_matches=await collect_league_matches(monitor)
+                    for candidate in all_matches:
+                        cid=str(candidate.get('match_id') or '')
+                        if cid and not candidate.get('is_live'):
+                            self.upcoming_ids.add(cid)
+                    newly_live=[m for m in all_matches if str(m.get('match_id') or '') in self.upcoming_ids
+                                and str(m.get('match_id'))!=str(item.get('match_id'))
+                                and m.get('is_live') and m.get('score_1') in (None,0)
+                                and m.get('score_2') in (None,0) and m.get('url')]
+                    if newly_live:
+                        next_match=newly_live[0]
+                        self.storage.event(mid,'SWITCH_TO_NEXT_MATCH',{'next_id':next_match['match_id'],'last_score':score_text(score)})
+                        self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
+                        self.log(f"Новый матч начался: {next_match['team_1']} — {next_match['team_2']}; переключение без ожидания финального свистка.")
+                        self.runtime.current_match=None
+                        await monitor.close()
+                        return
+                except Exception as exc:
+                    self.log(f"Проверка следующего матча: {type(exc).__name__}: {exc}")
             await self.wait(.5)
     async def store_odds(self,page,mid,score,t1,t2,reader):
         try:
