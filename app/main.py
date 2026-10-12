@@ -68,6 +68,8 @@ def export_all():
         archive.writestr('rush-matches.csv',csv_text(storage.list_matches()))
         archive.writestr('rush-goals.csv',csv_text(storage.all_goals()))
         archive.writestr('rush-odds.csv',csv_text(storage.all_odds()))
+        archive.writestr('rush-events.csv',csv_text(storage.all_events()))
+        archive.writestr('rush-standings.json',json.dumps(storage.calculated_standings(),ensure_ascii=False,indent=2))
     return StreamingResponse(iter([out.getvalue()]),media_type='application/zip',headers={'Content-Disposition':'attachment; filename=rush-all-data.zip'})
 @app.get('/api/export/full-history.xlsx')
 def export_xlsx():
