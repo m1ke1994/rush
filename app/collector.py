@@ -142,7 +142,12 @@ class Collector:
                 self.storage.set_match(mid,status='LIVE',started_at=datetime.utcnow().isoformat(),data_complete=int(complete))
                 self.storage.event(mid,'MATCH_STARTED',{'score':score_text(score),'period':period,'complete':complete})
                 self.log(f"Матч начался/подключён: {board.team1} — {board.team2}. Счёт {score_text(score)}.")
-            self.runtime.stage="Наблюдение выполняется"; self.runtime.current_match={'id':mid,'team1':board.team1,'team2':board.team2,'score':score_text(score),'half':period,'half_reason':period_reason,'time':game_time,'next_goal':sum(score)+1}
+            self.runtime.stage="Наблюдение выполняется"
+            previous=self.runtime.current_match or {}
+            current={'id':mid,'team1':board.team1,'team2':board.team2,'score':score_text(score),'half':period,'half_reason':period_reason,'time':game_time,'next_goal':sum(score)+1}
+            if previous.get('id')==mid and previous.get('score')==score_text(score):
+                current.update({k:previous[k] for k in ('odds_1','odds_2','market_status','canvas_status','odds_source','odds_reason') if k in previous})
+            self.runtime.current_match=current
             self.storage.set_match(mid,team_1=board.team1,team_2=board.team2)
             # 06:50 is the handover deadline: do not wait for 07:00 or for
             # a potentially stale bookmaker completion banner. Retire this ID
