@@ -8,5 +8,5 @@ def determine_match_half(game_time: str | None, scoreboard_status: str | None = 
     seconds=parse_time_to_seconds(game_time)
     if seconds is None:return 'UNKNOWN','Игровой таймер недоступен или некорректен'
     if seconds < 210:return '1','По накопительному игровому времени < 03:30'
-    if seconds == 210:return 'UNKNOWN','Граница 03:00: ожидается подтверждение статуса'
-    return '2','По накопительному игровому времени > 03:00'
+    if seconds == 210:return 'UNKNOWN','Граница 03:30: ожидается подтверждение статуса'
+    return '2','По накопительному игровому времени > 03:30'
