@@ -1,76 +1,133 @@
-"""Rush league card parser.  A card is the whole dashboard-game-block, not its row."""
+"""Reliable Rush card parser: countdown and elapsed game clocks are distinct."""
 import re
 from urllib.parse import urljoin
 
-MATCH_ID = re.compile(r"/(\d+)-[^/?#]+(?:[?#].*)?$")
+MATCH_ID = re.compile(r"/(\\d+)-[^/?#]+(?:[?#].*)?$")
+CLOCK = re.compile(r"(?<!\\d)(\\d{1,3}):(\\d{2})(?!\\d)")
+FINISHED = ("заверш", "окончен", "finished", "full time", "game over")
+LIVE_PERIOD = ("1-й тайм", "2-й тайм", "первый тайм", "второй тайм",
+               "1st half", "2nd half", "перерыв", "half time", "break")
 
-def parse_time_to_seconds(value: str) -> int | None:
-    try:
-        minutes, seconds = value.strip().split(':')
-        minutes, seconds = int(minutes), int(seconds)
-        return minutes * 60 + seconds if minutes >= 0 and 0 <= seconds < 60 else None
-    except (ValueError, AttributeError):
+
+def parse_time_to_seconds(value):
+    if not value:
         return None
+    match = CLOCK.search(str(value))
+    if not match:
+        return None
+    mins, secs = map(int, match.groups())
+    return mins * 60 + secs if secs < 60 else None
+
+
+def classify_match(period, time, score_1, score_2, live_marker=False):
+    """Never mistake a nonzero score for a confirmed LIVE timer."""
+    period = (period or "").strip().lower()
+    if any(mark in period for mark in FINISHED):
+        return "FINISHED"
+    if any(mark in period for mark in LIVE_PERIOD) or live_marker:
+        return "LIVE"
+    # Score proves that play started, not that it is still running.
+    if (score_1 is not None and score_2 is not None and score_1 + score_2 > 0):
+        return "STARTED_UNKNOWN"
+    # 00:00 with no explicit period is ambiguous; subsequent scans can clarify.
+    if parse_time_to_seconds(time) is not None and not period:
+        return "UPCOMING"
+    return "UNKNOWN"
+
 
 async def _text(card, selector):
-    item=card.locator(selector).first
-    if not await item.count(): return None
-    value=(await item.inner_text()).strip()
-    return value or None
+    if not selector:
+        return None
+    try:
+        locator = card.locator(selector).first
+        if not await locator.count():
+            return None
+        value = (await locator.inner_text(timeout=1250)).strip()
+        return value or None
+    except Exception:
+        return None
+
 
 async def _first_text(card, selectors):
     for selector in selectors:
-        value=await _text(card,selector)
-        if value:return value
+        value = await _text(card, selector)
+        if value:
+            return value
     return None
 
+
 async def collect_league_matches(page, logger=None):
-    cards=page.locator('.dashboard-game-block'); total=await cards.count(); result=[]
-    if logger: logger(f'Найдены карточки матчей: {total}')
+    from xbet_config import SELECTORS
+    cards = page.locator(".dashboard-game-block")
+    total = await cards.count()
+    result = []
+    if logger:
+        logger(f"Найдены карточки матчей: {total}")
     for index in range(total):
         try:
-            card=cards.nth(index); link=card.locator('a.dashboard-game-block__link').first
-            href=await link.get_attribute('href') if await link.count() else None
-            t1=await _text(card,'[data-test="betting-dashboard-game-first-team"] .dashboard-game-team-info__name')
-            t2=await _text(card,'[data-test="betting-dashboard-game-second-team"] .dashboard-game-team-info__name')
-            scores=card.locator('.ui-game-scores__item--total .ui-game-scores__num')
-            raw=[(await scores.nth(n).inner_text()).strip() for n in range(await scores.count())]
-            s1,s2=(int(raw[0]),int(raw[1])) if len(raw)>=2 and all(x.isdigit() for x in raw[:2]) else (None,None)
-            game_time=await _first_text(card,(
+            card = cards.nth(index)
+            link = card.locator("a.dashboard-game-block__link").first
+            href = await link.get_attribute("href") if await link.count() else None
+            team_1 = await _text(card, '[data-test="betting-dashboard-game-first-team"] .dashboard-game-team-info__name')
+            team_2 = await _text(card, '[data-test="betting-dashboard-game-second-team"] .dashboard-game-team-info__name')
+            scores = card.locator(".ui-game-scores__item--total .ui-game-scores__num")
+            raw = [(await scores.nth(i).inner_text()).strip() for i in range(min(await scores.count(), 2))]
+            score_1, score_2 = (int(raw[0]), int(raw[1])) if len(raw) == 2 and all(s.isdigit() for s in raw) else (None, None)
+            # The selectors from new_bot were implemented for the real dashboard.
+            time = await _first_text(card, (
+                SELECTORS.match_time,
                 '[data-test="betting-dashboard-game-info"] .dashboard-game-info__time',
-                '.dashboard-game-block__info .dashboard-game-info__time',
                 '.dashboard-game-info__time',
+                '.ui-game-timer__time .ui-game-timer__label',
+                '.ui-game-timer__label',
             ))
-            live=card.locator('.dashboard-game-action-bar[islive="true"], [islive="true"]'); is_live=bool(await live.count())
-            match=MATCH_ID.search(href or '')
-            # A nonzero displayed score is only a fallback signal when the site
-            # omits islive; it avoids silently discarding the only usable card.
-            inferred_live=not is_live and s1 is not None and s2 is not None and (s1+s2)>0
-            data={'match_id':match.group(1) if match else None,'team_1':t1,'team_2':t2,'score_1':s1,'score_2':s2,'game_time':game_time,'is_live':is_live or inferred_live,'href':href,'url':urljoin(page.url,href) if href else None,'status':'LIVE' if (is_live or inferred_live) else 'UNKNOWN','live_source':'attribute' if is_live else ('nonzero_score_fallback' if inferred_live else 'unknown')}
-            result.append(data)
-            if logger: logger(f'[{index+1}] {t1 or "?"} — {t2 or "?"}; счёт={s1}:{s2}; время={game_time or "?"}; LIVE={is_live}; ID={data["match_id"] or "?"}; URL={href or "?"}')
-        except Exception as error:
-            if logger: logger(f'Карточка {index+1} не разобрана: {type(error).__name__}: {error}')
+            period = await _first_text(card, (
+                SELECTORS.match_period,
+                '.dashboard-game-info__period',
+                '[data-test="betting-dashboard-game-info"] .ui-caption',
+            ))
+            live = bool(await card.locator('.dashboard-game-action-bar[islive="true"], [islive="true"]').count())
+            state = classify_match(period, time, score_1, score_2, live)
+            match = MATCH_ID.search(href or "")
+            info = {
+                "match_id": match.group(1) if match else None,
+                "team_1": team_1, "team_2": team_2,
+                "score_1": score_1, "score_2": score_2,
+                "game_time": time, "period": period,
+                "is_live": state == "LIVE", "is_upcoming": state == "UPCOMING",
+                "status": state, "href": href,
+                "url": urljoin(page.url, href) if href else None,
+            }
+            result.append(info)
+            if logger:
+                logger(f"[{index+1}] {team_1 or '?'} — {team_2 or '?'}; "
+                       f"счёт={score_1}:{score_2}; время={time or '?'}; "
+                       f"период={period or '?'}; статус={state}; ID={info['match_id'] or '?'}")
+        except Exception as exc:
+            if logger:
+                logger(f"Карточка {index+1} не разобрана: {type(exc).__name__}: {exc}")
     return result
 
+
 def select_match(matches, excluded_ids=()):
-    """Prefer a genuinely upcoming fixture; never reopen a retired/late match."""
-    excluded={str(x) for x in excluded_ids}
-    valid=[m for m in matches if m.get('href') and m.get('team_1') and m.get('team_2')
-           and str(m.get('match_id') or m.get('href')) not in excluded]
-    eligible=[]
-    for m in valid:
-        seconds=parse_time_to_seconds(m.get('game_time'))
-        # LIVE timers are elapsed match time. A match past 06:50 is stale.
-        if m.get('is_live') and seconds is not None and seconds>=410:
-            continue
-        eligible.append((m,seconds))
-    upcoming=[(m,t) for m,t in eligible if not m.get('is_live') and t is not None]
-    live=[(m,t) for m,t in eligible if m.get('is_live')]
+    """Prefer nearest countdown; never pick a stale match due to a missing clock."""
+    excluded = {str(x) for x in excluded_ids}
+    valid = [m for m in matches if m.get("href") and m.get("team_1") and m.get("team_2")
+             and str(m.get("match_id") or m.get("href")) not in excluded]
+    # A truly unknown card may be the nearest: wait for hydration instead of guessing.
+    unknown = [m for m in valid if m.get("status") in ("UNKNOWN", "STARTED_UNKNOWN")]
+    upcoming = [(m, parse_time_to_seconds(m.get("game_time"))) for m in valid
+                if m.get("is_upcoming") or m.get("status") == "UPCOMING"]
+    upcoming = [(m, sec) for m, sec in upcoming if sec is not None]
     if upcoming:
-        chosen=min(upcoming,key=lambda pair:pair[1])[0]
-        return chosen,'ближайший предстоящий матч по обратному отсчёту'
-    if live:
-        chosen=min(live,key=lambda pair:pair[1] if pair[1] is not None else 10**9)[0]
-        return chosen,'LIVE с минимальным прошедшим игровым временем'
-    return None,'нет новых пригодных матчей; старые/завершённые исключены'
+        candidate, seconds = min(upcoming, key=lambda x: x[1])
+        # A card missing its countdown could start earlier; do not select blindly.
+        if unknown and not any(m.get("is_live") for m in unknown):
+            return None, "карточки без времени/статуса: ожидаем уточнения DOM"
+        return candidate, f"ближайший матч до начала: {seconds} сек"
+    live = [(m, parse_time_to_seconds(m.get("game_time"))) for m in valid if m.get("is_live")]
+    live = [(m, sec) for m, sec in live if sec is not None and sec < 410]
+    if live and not unknown:
+        chosen, seconds = min(live, key=lambda x: x[1])
+        return chosen, f"резерв: подтверждённый LIVE, сыграно {seconds} сек"
+    return None, "время/период не подтверждены; продолжаем наблюдать лигу"
