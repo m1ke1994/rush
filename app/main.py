@@ -1,7 +1,7 @@
 import asyncio, csv, io, json, zipfile
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from .config import DATABASE, HOST, PORT
 from .storage import Storage
@@ -72,7 +72,18 @@ def export_all():
 @app.get('/api/export/full-history.xlsx')
 def export_xlsx():
     name=datetime.now().strftime('rush_full_history_%Y-%m-%d_%H-%M.xlsx')
-    return StreamingResponse(iter([excel_workbook(storage)]),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename={name}'})
+    try:
+        payload=excel_workbook(storage)
+        # An XLSX is a ZIP archive; never send an error page with .xlsx extension.
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            if archive.testzip() is not None or 'xl/workbook.xml' not in archive.namelist():
+                raise ValueError("Некорректная структура XLSX")
+    except Exception as exc:
+        collector.log(f"Ошибка формирования Excel: {type(exc).__name__}: {exc}")
+        raise HTTPException(500, "Ошибка создания Excel. Подробности в журнале backend.") from exc
+    return Response(content=payload,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    headers={'Content-Disposition':f'attachment; filename="{name}"',
+                             'Cache-Control':'no-store'})
 def csv_text(rows):
     out=io.StringIO(); keys=list(rows[0]) if rows else []
     writer=csv.DictWriter(out,fieldnames=keys,extrasaction='ignore'); writer.writeheader()
