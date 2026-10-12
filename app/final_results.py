@@ -87,7 +87,7 @@ class FinalResultReconciler:
         self.scoreboard_reader=scoreboard_reader
         self._attempts={}
 
-    async def run(self, active_page):
+    async def run(self):
         tab=None
         try:
             # Wait until the main browser has settled; never steal the active tab.
@@ -98,9 +98,11 @@ class FinalResultReconciler:
                 pending=[m for m in pending if safe_match_url(m,self.league_url)]
                 if pending:
                     if tab is None or tab.is_closed():
-                        tab=await active_page.context.new_page()
+                        context=await self.manager.ensure_browser()
+                        tab=await context.new_page()
                         try:
-                            if not active_page.is_closed():
+                            active_page=self.manager.page
+                            if active_page is not None and not active_page.is_closed():
                                 await active_page.bring_to_front()
                         except Exception:
                             pass
