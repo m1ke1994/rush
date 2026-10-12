@@ -192,7 +192,6 @@ class Collector:
             if loop_time-last_monitor>=2.0:
                 last_monitor=loop_time
                 try:
-                    await monitor.reload(wait_until='domcontentloaded',timeout=6500)
                     all_matches=await collect_league_matches(monitor)
                     for candidate in all_matches:
                         cid=str(candidate.get('match_id') or '')
