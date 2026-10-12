@@ -65,7 +65,10 @@ class Storage:
         with self.connection() as con:
             con.execute('''INSERT INTO matches(external_match_id,league,team_1,team_2,scheduled_at,status,created_at)
             VALUES(?,?,?,?,?,?,?) ON CONFLICT(external_match_id) DO UPDATE SET
-            team_1=excluded.team_1, team_2=excluded.team_2, status=excluded.status''',
+            team_1=excluded.team_1, team_2=excluded.team_2,
+            status=CASE WHEN matches.status='FINISHED' THEN 'FINISHED'
+                        WHEN excluded.status='UPCOMING' AND matches.status IN ('LIVE','INTERRUPTED') THEN matches.status
+                        ELSE excluded.status END''',
             (external_id, league, team1, team2, scheduled_at, status, now()))
             return con.execute("SELECT id FROM matches WHERE external_match_id=?", (external_id,)).fetchone()[0]
 
@@ -180,6 +183,47 @@ class Storage:
             for table in ("goal_events", "odds_snapshots", "match_events", "matches"):
                 con.execute(f"DELETE FROM {table}")
             return counts
+
+    def pending_final_results(self, limit=100):
+        """Matches observed live but without a verified final score."""
+        with self.connection() as con:
+            return [dict(row) for row in con.execute(
+                """SELECT * FROM matches
+                   WHERE status IN ('LIVE','INTERRUPTED')
+                     AND final_score IS NULL AND started_at IS NOT NULL
+                   ORDER BY id DESC LIMIT ?""", (limit,))]
+
+    def finalize_observed_match(self, match_id, score, *, first_half=None, source="MATCH_PAGE"):
+        """Confirm final score without altering original goal/odds observations.
+
+        A complete final result is not proof that the goal sequence was complete.
+        """
+        import re
+        if not re.fullmatch(r"\\d+:\\d+", str(score)):
+            raise ValueError("Недопустимый итоговый счёт")
+        a,b=(int(v) for v in score.split(":"))
+        with self.connection() as con:
+            match=con.execute("SELECT * FROM matches WHERE id=?", (match_id,)).fetchone()
+            if match is None:
+                return False
+            if match["status"]=="FINISHED":
+                return False
+            first=first_half or match["first_half_score"]
+            second=None
+            if first and re.fullmatch(r"\\d+:\\d+",first):
+                x,y=(int(v) for v in first.split(":"))
+                if a>=x and b>=y:
+                    second=f"{a-x}:{b-y}"
+            winner="Ничья" if a==b else (match["team_1"] if a>b else match["team_2"])
+            con.execute("""UPDATE matches SET status='FINISHED',final_score=?,
+                finished_at=?,winner=?,total_goals=?,second_half_score=?
+                WHERE id=? AND status!='FINISHED'""",
+                (score,now(),winner,a+b,second,match_id))
+            encoded=json.dumps({"final_score":score,"source":source,"second_half_score":second},ensure_ascii=False,sort_keys=True)
+            con.execute("""INSERT OR IGNORE INTO match_events
+                (match_id,event_type,event_data,detected_at) VALUES(?,?,?,?)""",
+                (match_id,"FINAL_RESULT_CONFIRMED",encoded,now()))
+        return True
 
     def calculated_standings(self):
         """Derived standings from fully observed finished matches only.
