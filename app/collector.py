@@ -50,12 +50,28 @@ class Collector:
             while not self.stop_event.is_set():
                 self.runtime.stage="Поиск ближайшего матча"; self.runtime.league="Переход в FC 26. 5x5 Rush"
                 await page.goto(URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=30000); self.runtime.league="Лига подключена"
-                matches=await collect_league_matches(page,self.log)
+                # Wait for SPA countdown labels instead of reloading the site.
+                matches=[]
+                for attempt in range(4):
+                    matches=await collect_league_matches(page, self.log if attempt==3 else None)
+                    if any(m.get('is_upcoming') for m in matches):
+                        break
+                    if attempt<3:
+                        await self.wait(.4)
+                for candidate in matches:
+                    if candidate.get('match_id') and candidate.get('is_upcoming'):
+                        self.storage.upsert_match(
+                            str(candidate['match_id']), LEAGUE_NAME,
+                            candidate.get('team_1') or 'Не определено',
+                            candidate.get('team_2') or 'Не определено',
+                            'UPCOMING', candidate.get('game_time'))
+                self.log(f"Сканирование: {len(matches)} карточек; "
+                         f"{sum(bool(m.get('is_upcoming')) for m in matches)} с обратным отсчётом.")
                 target=self.pending_next_id
                 item=next((m for m in matches if str(m.get('match_id'))==target and m.get('url')),None) if target else None
                 self.pending_next_id=None
-                self.upcoming_ids.update(str(m['match_id']) for m in matches if not m['is_live'] and m.get('match_id'))
-                if item and str(item.get('match_id')) in self.retired_match_ids:
+                self.upcoming_ids.update(str(m['match_id']) for m in matches if m.get('is_upcoming') and m.get('match_id'))
+                if item and (str(item.get('match_id')) in self.retired_match_ids or item.get('status') in ('FINISHED','STARTED_UNKNOWN')):
                     item=None
                 if item: reason='следующий матч начал игру; приоритет немедленного переключения'
                 else: item,reason=select_match(matches, excluded_ids=self.retired_match_ids)
@@ -84,14 +100,29 @@ class Collector:
         # We never wait for the previous match to finish once a previously upcoming match starts.
         monitor=await page.context.new_page()
         last_monitor=0.0
-        last_odds_score=None
+        last_odds_score=None; scoreboard_failures=0
         try:
             await monitor.goto(__import__('xbet_config').URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=20000)
         except Exception as exc:
             self.log(f"Фоновый монитор лиги недоступен: {exc}")
         while not self.stop_event.is_set():
             try: board=await read_scoreboard(page)
-            except score_error as exc: self.runtime.stage="Ожидание данных scoreboard"; self.log(f"Scoreboard временно недоступен: {exc}"); await self.wait(.7); continue
+            except score_error as exc:
+                scoreboard_failures+=1
+                self.runtime.stage="Ожидание данных scoreboard"
+                if scoreboard_failures in (1,5,15):
+                    self.log(f"Scoreboard ещё не готов ({scoreboard_failures}): {exc}")
+                if scoreboard_failures>=15:
+                    self.retired_match_ids.add(external)
+                    self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
+                    self.storage.event(mid,'SCOREBOARD_UNAVAILABLE',{'reason':str(exc)})
+                    self.log("Табло недоступно: выбираем другой матч, без бесконечного ожидания.")
+                    await monitor.close()
+                    self.runtime.current_match=None
+                    return
+                await self.wait(.5)
+                continue
+            scoreboard_failures=0
             # The status block contains both text (e.g. "Игра завершена") and
             # the clock. Read them separately: treating the status as a timer
             # caused completed matches to remain in the observer forever.
@@ -133,7 +164,11 @@ class Collector:
             # Read odds once per score change, not every 0.5 seconds.
             if last_odds_score != score:
                 last_odds_score=score
-                await self.store_odds(page,mid,score,board.team1,board.team2,read_odds)
+                try:
+                    await asyncio.wait_for(
+                        self.store_odds(page,mid,score,board.team1,board.team2,read_odds), timeout=5)
+                except TimeoutError:
+                    self.log("Чтение коэффициентов более 5 секунд; возвращаемся к проверке табло.")
             for kind,team,confidence,before in tracker.transition(Observation(score,period,board.timer)):
                 if kind=='GOAL':
                     scorer=board.team1 if team==1 else board.team2; self.storage.goal(mid,sum(score),scorer,score_text(before),score_text(score),self.half(period),game_time or None,confidence); self.log(f"Гол команды {scorer}. Счёт {score_text(score)}.")
@@ -158,11 +193,13 @@ class Collector:
                     all_matches=await collect_league_matches(monitor)
                     for candidate in all_matches:
                         cid=str(candidate.get('match_id') or '')
-                        if cid and not candidate.get('is_live'):
+                        if cid and candidate.get('is_upcoming'):
                             self.upcoming_ids.add(cid)
                     newly_live=[m for m in all_matches if str(m.get('match_id') or '') in self.upcoming_ids
                                 and str(m.get('match_id'))!=str(item.get('match_id'))
-                                and m.get('is_live') and m.get('score_1') in (None,0)
+                                and m.get('is_live') and parse_time_to_seconds(m.get('game_time')) is not None
+                                and parse_time_to_seconds(m.get('game_time'))<410
+                                and m.get('score_1') in (None,0)
                                 and m.get('score_2') in (None,0) and m.get('url')]
                     if newly_live:
                         next_match=newly_live[0]
