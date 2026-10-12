@@ -2,8 +2,8 @@
 import re
 from urllib.parse import urljoin
 
-MATCH_ID = re.compile(r"/(\\d+)-[^/?#]+(?:[?#].*)?$")
-CLOCK = re.compile(r"(?<!\\d)(\\d{1,3}):(\\d{2})(?!\\d)")
+MATCH_ID = re.compile(r"/(\d+)-[^/?#]+(?:[?#].*)?$")
+CLOCK = re.compile(r"(?<!\d)(\d{1,3}):(\d{2})(?!\d)")
 FINISHED = ("заверш", "окончен", "finished", "full time", "game over")
 LIVE_PERIOD = ("1-й тайм", "2-й тайм", "первый тайм", "второй тайм",
                "1st half", "2nd half", "перерыв", "half time", "break")
