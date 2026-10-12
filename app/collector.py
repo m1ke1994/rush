@@ -184,6 +184,7 @@ class Collector:
             except Exception:
                 game_time=board.timer
             score=(board.score.team1,board.score.team2); period,period_reason=determine_match_half(game_time,scoreboard_status)
+            self.storage.record_score_snapshot(mid,score_text(score),game_time)
             if tracker is None:
                 tracker=GoalTracker(score); complete=score==(0,0)
                 self.storage.set_match(mid,status='LIVE',started_at=datetime.utcnow().isoformat(),data_complete=int(complete))
@@ -209,8 +210,9 @@ class Collector:
                 return
             if elapsed is not None and elapsed>=410:
                 self.retired_match_ids.add(external)
+                self.storage.record_score_snapshot(mid,score_text(score),game_time,source="HANDOVER_0650")
                 self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
-                self.storage.event(mid,'HANDOVER_0650',{'score':score_text(score),'time':game_time})
+                self.storage.event(mid,'HANDOVER_0650',{'score':score_text(score),'time':game_time,'first_half':score_text(first_half) if first_half else None,'second_half_observed':self.storage.half_difference(score_text(first_half),score_text(score)) if first_half else None})
                 self.log(f"Достигнуто {game_time} (порог 06:50): немедленный переход к поиску следующего матча.")
                 self.runtime.current_match=None
                 await monitor.close()
@@ -244,11 +246,11 @@ class Collector:
                 last_first_half_score=score
             elif period=='2' and first_half is None and last_first_half_score is not None:
                 first_half=last_first_half_score
-                self.storage.set_match(mid,first_half_score=score_text(first_half))
+                self.storage.set_first_half_score(mid,score_text(first_half))
                 self.log(f"Первый тайм зафиксирован при переходе ко второму: {score_text(first_half)}.")
             low=period.lower()
             if first_half is None and any(x in low for x in ('перерыв','half time','тайм заверш')):
-                first_half=score; self.storage.set_match(mid,first_half_score=score_text(score)); self.log(f"Первый тайм завершён: {score_text(score)}.")
+                first_half=score; self.storage.set_first_half_score(mid,score_text(score)); self.log(f"Первый тайм завершён: {score_text(score)}.")
             # Timer/score on the league cards is a fallback; never treat a completed
             # old match as a newly started match.
             loop_time=asyncio.get_running_loop().time()
@@ -270,7 +272,8 @@ class Collector:
                         next_match=newly_live[0]
                         self.retired_match_ids.add(external)
                         self.pending_next_id=str(next_match['match_id'])
-                        self.storage.event(mid,'SWITCH_TO_NEXT_MATCH',{'next_id':next_match['match_id'],'last_score':score_text(score)})
+                        self.storage.record_score_snapshot(mid,score_text(score),game_time,source="SWITCH_TO_NEXT_MATCH")
+                        self.storage.event(mid,'SWITCH_TO_NEXT_MATCH',{'next_id':next_match['match_id'],'last_score':score_text(score),'first_half':score_text(first_half) if first_half else None})
                         self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
                         self.log(f"Новый матч начался: {next_match['team_1']} — {next_match['team_2']}; переключение без ожидания финального свистка.")
                         self.runtime.current_match=None
