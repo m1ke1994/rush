@@ -60,16 +60,21 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_goals_match ON goal_events(match_id, goal_number);
             CREATE INDEX IF NOT EXISTS idx_odds_match ON odds_snapshots(match_id, id);
             ''')
+            # Additive migration: existing Rush databases and all observations stay intact.
+            columns={row["name"] for row in con.execute("PRAGMA table_info(matches)")}
+            if "match_url" not in columns:
+                con.execute("ALTER TABLE matches ADD COLUMN match_url TEXT")
 
-    def upsert_match(self, external_id, league, team1, team2, status="UPCOMING", scheduled_at=None):
+    def upsert_match(self, external_id, league, team1, team2, status="UPCOMING", scheduled_at=None, match_url=None):
         with self.connection() as con:
-            con.execute('''INSERT INTO matches(external_match_id,league,team_1,team_2,scheduled_at,status,created_at)
-            VALUES(?,?,?,?,?,?,?) ON CONFLICT(external_match_id) DO UPDATE SET
+            con.execute('''INSERT INTO matches(external_match_id,league,team_1,team_2,scheduled_at,status,created_at,match_url)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(external_match_id) DO UPDATE SET
             team_1=excluded.team_1, team_2=excluded.team_2,
+            match_url=COALESCE(excluded.match_url,matches.match_url),
             status=CASE WHEN matches.status='FINISHED' THEN 'FINISHED'
                         WHEN excluded.status='UPCOMING' AND matches.status IN ('LIVE','INTERRUPTED') THEN matches.status
                         ELSE excluded.status END''',
-            (external_id, league, team1, team2, scheduled_at, status, now()))
+            (external_id, league, team1, team2, scheduled_at, status, now(),match_url))
             return con.execute("SELECT id FROM matches WHERE external_match_id=?", (external_id,)).fetchone()[0]
 
     def set_match(self, match_id, **fields):
