@@ -17,7 +17,7 @@ class Runtime:
 
 class Collector:
     def __init__(self, storage):
-        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set()
+        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None
     def snapshot(self): return asdict(self.runtime)
     def log(self, text):
         item={"time":datetime.now().strftime("%H:%M:%S"),"message":text}; self.runtime.logs=(self.runtime.logs+[item])[-120:]; print(f"[{item['time']}] {text}")
@@ -50,7 +50,13 @@ class Collector:
             while not self.stop_event.is_set():
                 self.runtime.stage="Поиск ближайшего матча"; self.runtime.league="Переход в FC 26. 5x5 Rush"
                 await page.goto(URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=30000); self.runtime.league="Лига подключена"
-                matches=await collect_league_matches(page,self.log); self.upcoming_ids={str(m['match_id']) for m in matches if not m['is_live'] and m.get('match_id')}; item,reason=select_match(matches); self.log(f"Причина выбора: {reason}.")
+                matches=await collect_league_matches(page,self.log)
+                target=self.pending_next_id
+                item=next((m for m in matches if str(m.get('match_id'))==target and m.get('url')),None) if target else None
+                self.pending_next_id=None
+                self.upcoming_ids.update(str(m['match_id']) for m in matches if not m['is_live'] and m.get('match_id'))
+                if item: reason='следующий матч начал игру; приоритет немедленного переключения'
+                else: item,reason=select_match(matches) self.log(f"Причина выбора: {reason}.")
                 if not item: self.runtime.stage="Ожидание ближайшего матча"; await self.wait(3); continue
                 self.log(f"Выбран матч: {item.get('team_1')} — {item.get('team_2')}.")
                 try:
@@ -134,6 +140,7 @@ class Collector:
                                 and m.get('score_2') in (None,0) and m.get('url')]
                     if newly_live:
                         next_match=newly_live[0]
+                        self.pending_next_id=str(next_match['match_id'])
                         self.storage.event(mid,'SWITCH_TO_NEXT_MATCH',{'next_id':next_match['match_id'],'last_score':score_text(score)})
                         self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
                         self.log(f"Новый матч начался: {next_match['team_1']} — {next_match['team_2']}; переключение без ожидания финального свистка.")
