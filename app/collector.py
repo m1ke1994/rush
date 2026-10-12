@@ -53,7 +53,7 @@ class Collector:
                 # Wait for SPA countdown labels instead of reloading the site.
                 matches=[]
                 for attempt in range(4):
-                    matches=await collect_league_matches(page, self.log if attempt==3 else None)
+                    matches=await asyncio.wait_for(collect_league_matches(page, self.log if attempt==3 else None), timeout=8)
                     if any(m.get('is_upcoming') for m in matches):
                         break
                     if attempt<3:
@@ -81,7 +81,7 @@ class Collector:
                 try:
                     self.runtime.stage="Открытие матча"; self.log(f"Открываем: {item['url']}")
                     await page.goto(item['url'],wait_until='domcontentloaded',timeout=30000); self.log("Переход выполнен; ожидаем табло.")
-                    await self.observe(page,item,read_scoreboard,ScoreReadError,read_next_goal_odds,SELECTORS)
+                    await asyncio.wait_for(self.observe(page,item,read_scoreboard,ScoreReadError,read_next_goal_odds,SELECTORS), timeout=540)
                 except Exception as exc: self.runtime.errors+=1; self.log(f"Ошибка перехода/наблюдения: {type(exc).__name__}: {exc}"); await self.wait(2)
         except asyncio.CancelledError: raise
         except Exception as exc: self.runtime.errors+=1; self.runtime.stage="Ошибка жизненного цикла"; self.log(f"Ошибка жизненного цикла: {type(exc).__name__}: {exc}")
@@ -108,8 +108,8 @@ class Collector:
         # new_page() focuses the observer tab; always show the actual game.
         await page.bring_to_front()
         while not self.stop_event.is_set():
-            try: board=await read_scoreboard(page)
-            except score_error as exc:
+            try: board=await asyncio.wait_for(read_scoreboard(page), timeout=4)
+            except (score_error, TimeoutError) as exc:
                 scoreboard_failures+=1
                 self.runtime.stage="Ожидание данных scoreboard"
                 if scoreboard_failures in (1,5,15):
@@ -200,7 +200,7 @@ class Collector:
             if loop_time-last_monitor>=2.0:
                 last_monitor=loop_time
                 try:
-                    all_matches=await collect_league_matches(monitor)
+                    all_matches=await asyncio.wait_for(collect_league_matches(monitor),timeout=5)
                     for candidate in all_matches:
                         cid=str(candidate.get('match_id') or '')
                         if cid and candidate.get('is_upcoming'):
