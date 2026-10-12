@@ -115,16 +115,13 @@ def select_match(matches, excluded_ids=()):
     valid = [m for m in matches if m.get("href") and m.get("team_1") and m.get("team_2")
              and str(m.get("match_id") or m.get("href")) not in excluded]
     # A truly unknown card may be the nearest: wait for hydration instead of guessing.
-    unknown = [m for m in valid if m.get("status") in ("UNKNOWN", "STARTED_UNKNOWN")]
+    unknown = [m for m in valid if m.get("status") == "UNKNOWN"]
     upcoming = [(m, parse_time_to_seconds(m.get("game_time"))) for m in valid
-                if m.get("is_upcoming") or m.get("status") == "UPCOMING"]
+                if m.get("is_upcoming") or m.get("status") == "UPCOMING" or (m.get("status") is None and not m.get("is_live"))]
     upcoming = [(m, sec) for m, sec in upcoming if sec is not None]
     if upcoming:
         candidate, seconds = min(upcoming, key=lambda x: x[1])
-        # A card missing its countdown could start earlier; do not select blindly.
-        if unknown and not any(m.get("is_live") for m in unknown):
-            return None, "карточки без времени/статуса: ожидаем уточнения DOM"
-        return candidate, f"ближайший матч до начала: {seconds} сек"
+        return candidate, f"ближайший подтверждённый отсчёт: {seconds} сек; карточек без статуса: {len(unknown)}"
     live = [(m, parse_time_to_seconds(m.get("game_time"))) for m in valid if m.get("is_live")]
     live = [(m, sec) for m, sec in live if sec is not None and sec < 410]
     if live and not unknown:
