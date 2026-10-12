@@ -202,7 +202,7 @@ class Storage:
         import re
         if not first or not total:
             return None
-        if not re.fullmatch(r"\\d+:\\d+",str(first)) or not re.fullmatch(r"\\d+:\\d+",str(total)):
+        if not re.fullmatch(r"\d+:\d+",str(first)) or not re.fullmatch(r"\d+:\d+",str(total)):
             return None
         a,b=map(int,first.split(":"))
         x,y=map(int,total.split(":"))
@@ -211,7 +211,7 @@ class Storage:
     def record_score_snapshot(self, match_id, score, game_time=None, *, source="SCOREBOARD"):
         """Record latest confirmed observation without pretending it is final."""
         import re
-        if not re.fullmatch(r"\\d+:\\d+",str(score)):
+        if not re.fullmatch(r"\d+:\d+",str(score)):
             raise ValueError("Неверный формат счёта")
         with self.connection() as con:
             match=con.execute("SELECT first_half_score,status FROM matches WHERE id=?",(match_id,)).fetchone()
@@ -262,7 +262,7 @@ class Storage:
         A complete final result is not proof that the goal sequence was complete.
         """
         import re
-        if not re.fullmatch(r"\\d+:\\d+", str(score)):
+        if not re.fullmatch(r"\d+:\d+", str(score)):
             raise ValueError("Недопустимый итоговый счёт")
         a,b=(int(v) for v in score.split(":"))
         with self.connection() as con:
@@ -273,7 +273,7 @@ class Storage:
                 return False
             first=first_half or match["first_half_score"]
             second=None
-            if first and re.fullmatch(r"\\d+:\\d+",first):
+            if first and re.fullmatch(r"\d+:\d+",first):
                 x,y=(int(v) for v in first.split(":"))
                 if a>=x and b>=y:
                     second=f"{a-x}:{b-y}"
