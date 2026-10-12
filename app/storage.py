@@ -231,12 +231,12 @@ class Storage:
         return True
 
     def calculated_standings(self):
-        """Derived standings from fully observed finished matches only.
+        """Derived standings from verified final scores, regardless of goal-event coverage.
         This is not the official bookmaker standings."""
         with self.connection() as con:
             fixtures=[dict(r) for r in con.execute(
                 "SELECT id,team_1,team_2,final_score,finished_at FROM matches "
-                "WHERE status='FINISHED' AND final_score IS NOT NULL AND data_complete=1 "
+                "WHERE status='FINISHED' AND final_score IS NOT NULL "
                 "ORDER BY COALESCE(finished_at,created_at),id")]
         stats={}
         for m in fixtures:
@@ -254,4 +254,4 @@ class Storage:
         for index,row in enumerate(table,1):
             row['position']=index
             row['goal_difference']=row['goals_for']-row['goals_against']
-        return {'source':'LOCAL_FINISHED_COMPLETE_ONLY','matches_count':len(fixtures),'table':table}
+        return {'source':'LOCAL_VERIFIED_FINAL_RESULTS','matches_count':len(fixtures),'table':table}
