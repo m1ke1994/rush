@@ -53,14 +53,24 @@ async def collect_league_matches(page, logger=None):
             if logger: logger(f'Карточка {index+1} не разобрана: {type(error).__name__}: {error}')
     return result
 
-def select_match(matches):
-    valid=[m for m in matches if m.get('href') and m.get('team_1') and m.get('team_2')]
-    live=[m for m in valid if m['is_live']]
-    upcoming=[m for m in valid if not m['is_live'] and parse_time_to_seconds(m.get('game_time')) is not None]
+def select_match(matches, excluded_ids=()):
+    """Prefer a genuinely upcoming fixture; never reopen a retired/late match."""
+    excluded={str(x) for x in excluded_ids}
+    valid=[m for m in matches if m.get('href') and m.get('team_1') and m.get('team_2')
+           and str(m.get('match_id') or m.get('href')) not in excluded]
+    eligible=[]
+    for m in valid:
+        seconds=parse_time_to_seconds(m.get('game_time'))
+        # LIVE timers are elapsed match time. A match past 06:50 is stale.
+        if m.get('is_live') and seconds is not None and seconds>=410:
+            continue
+        eligible.append((m,seconds))
+    upcoming=[(m,t) for m,t in eligible if not m.get('is_live') and t is not None]
+    live=[(m,t) for m,t in eligible if m.get('is_live')]
     if upcoming:
-        return min(upcoming,key=lambda x:parse_time_to_seconds(x['game_time'])),'предстоящий матч с минимальным временем до начала'
-    if live: return min(live,key=lambda x:parse_time_to_seconds(x.get('game_time')) or 10**9),'предстоящих нет; LIVE с минимальным игровым временем'
-    # No status signal must be diagnostic, not a deadlock.  Open a concrete
-    # card and mark its collected history incomplete until scoreboard confirms it.
-    if valid:return valid[0],'статус/таймер недоступны; выбран доступный матч с неполной историей'
-    return None,'нет карточек с командами и настоящей ссылкой'
+        chosen=min(upcoming,key=lambda pair:pair[1])[0]
+        return chosen,'ближайший предстоящий матч по обратному отсчёту'
+    if live:
+        chosen=min(live,key=lambda pair:pair[1] if pair[1] is not None else 10**9)[0]
+        return chosen,'LIVE с минимальным прошедшим игровым временем'
+    return None,'нет новых пригодных матчей; старые/завершённые исключены'
