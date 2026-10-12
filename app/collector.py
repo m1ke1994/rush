@@ -6,7 +6,7 @@ from typing import Any
 from dotenv import load_dotenv
 from .config import ROOT, LEAGUE_NAME
 from .goal_tracker import GoalTracker, Observation, score_text
-from .league_parser import collect_league_matches, select_match
+from .league_parser import collect_league_matches, select_match, parse_time_to_seconds
 from .periods import determine_match_half
 
 @dataclass
@@ -17,7 +17,7 @@ class Runtime:
 
 class Collector:
     def __init__(self, storage):
-        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None
+        self.storage=storage; self.runtime=Runtime(); self.stop_event=asyncio.Event(); self.task=None; self.manager=None; self.league_page=None; self.upcoming_ids=set(); self.pending_next_id=None; self.retired_match_ids=set()
     def snapshot(self): return asdict(self.runtime)
     def log(self, text):
         item={"time":datetime.now().strftime("%H:%M:%S"),"message":text}; self.runtime.logs=(self.runtime.logs+[item])[-120:]; print(f"[{item['time']}] {text}")
@@ -55,8 +55,11 @@ class Collector:
                 item=next((m for m in matches if str(m.get('match_id'))==target and m.get('url')),None) if target else None
                 self.pending_next_id=None
                 self.upcoming_ids.update(str(m['match_id']) for m in matches if not m['is_live'] and m.get('match_id'))
+                if item and str(item.get('match_id')) in self.retired_match_ids:
+                    item=None
                 if item: reason='следующий матч начал игру; приоритет немедленного переключения'
-                else: item,reason=select_match(matches) self.log(f"Причина выбора: {reason}.")
+                else: item,reason=select_match(matches, excluded_ids=self.retired_match_ids)
+                self.log(f"Причина выбора: {reason}.")
                 if not item: self.runtime.stage="Ожидание ближайшего матча"; await self.wait(3); continue
                 self.log(f"Выбран матч: {item.get('team_1')} — {item.get('team_2')}.")
                 try:
@@ -108,6 +111,25 @@ class Collector:
                 self.log(f"Матч начался/подключён: {board.team1} — {board.team2}. Счёт {score_text(score)}.")
             self.runtime.stage="Наблюдение выполняется"; self.runtime.current_match={'id':mid,'team1':board.team1,'team2':board.team2,'score':score_text(score),'half':period,'half_reason':period_reason,'time':game_time,'next_goal':sum(score)+1}
             self.storage.set_match(mid,team_1=board.team1,team_2=board.team2)
+            # 06:50 is the handover deadline: do not wait for 07:00 or for
+            # a potentially stale bookmaker completion banner. Retire this ID
+            # before navigating, so the same match cannot be picked again.
+            elapsed=parse_time_to_seconds(game_time)
+            if await self.finished(page,scoreboard_status,selectors):
+                self.retired_match_ids.add(external)
+                self.finish(mid,score,first_half,board.team1,board.team2)
+                self.log(f"Матч завершён. Итоговый счёт {score_text(score)}.")
+                self.runtime.current_match=None
+                await monitor.close()
+                return
+            if elapsed is not None and elapsed>=410:
+                self.retired_match_ids.add(external)
+                self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
+                self.storage.event(mid,'HANDOVER_0650',{'score':score_text(score),'time':game_time})
+                self.log(f"Достигнуто {game_time} (порог 06:50): немедленный переход к поиску следующего матча.")
+                self.runtime.current_match=None
+                await monitor.close()
+                return
             # Read odds once per score change, not every 0.5 seconds.
             if last_odds_score != score:
                 last_odds_score=score
@@ -126,8 +148,6 @@ class Collector:
             low=period.lower()
             if first_half is None and any(x in low for x in ('перерыв','half time','тайм заверш')):
                 first_half=score; self.storage.set_match(mid,first_half_score=score_text(score)); self.log(f"Первый тайм завершён: {score_text(score)}.")
-            if await self.finished(page,scoreboard_status,selectors):
-                self.finish(mid,score,first_half,board.team1,board.team2); self.log(f"Матч завершён. Итоговый счёт {score_text(score)}."); self.runtime.current_match=None; await monitor.close(); return
             # Timer/score on the league cards is a fallback; never treat a completed
             # old match as a newly started match.
             loop_time=asyncio.get_running_loop().time()
@@ -146,6 +166,7 @@ class Collector:
                                 and m.get('score_2') in (None,0) and m.get('url')]
                     if newly_live:
                         next_match=newly_live[0]
+                        self.retired_match_ids.add(external)
                         self.pending_next_id=str(next_match['match_id'])
                         self.storage.event(mid,'SWITCH_TO_NEXT_MATCH',{'next_id':next_match['match_id'],'last_score':score_text(score)})
                         self.storage.set_match(mid,status='INTERRUPTED',data_complete=0)
