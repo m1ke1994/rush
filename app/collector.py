@@ -49,7 +49,19 @@ class Collector:
                 self.runtime.auth="Требуется ручная авторизация"; self.runtime.stage="Ожидание ручной авторизации"; self.log("Маркер RUB не найден; ожидаю ручной вход."); await self.wait(2)
             while not self.stop_event.is_set():
                 self.runtime.stage="Поиск ближайшего матча"; self.runtime.league="Переход в FC 26. 5x5 Rush"
-                await page.goto(URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=30000); self.runtime.league="Лига подключена"
+                try:
+                    await page.goto(URL_CONFIG.next_goal_league_url,wait_until='domcontentloaded',timeout=12000)
+                    self.runtime.league="Лига подключена"
+                except Exception as exc:
+                    self.runtime.errors+=1
+                    self.log(f"Лига не загрузилась ({type(exc).__name__}): {exc}; восстанавливаем вкладку.")
+                    self.runtime.stage="Восстановление страницы лиги"
+                    try:
+                        page=await asyncio.wait_for(self.manager.recover_navigation(exc),timeout=20)
+                    except Exception as recovery_error:
+                        self.log(f"Восстановление навигации отложено: {type(recovery_error).__name__}: {recovery_error}")
+                    await self.wait(3)
+                    continue
                 # Wait for SPA countdown labels instead of reloading the site.
                 matches=[]
                 for attempt in range(4):
