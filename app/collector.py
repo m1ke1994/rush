@@ -179,7 +179,7 @@ class Collector:
             previous=self.runtime.current_match or {}
             current={'id':mid,'team1':board.team1,'team2':board.team2,'score':score_text(score),'half':period,'half_reason':period_reason,'time':game_time,'next_goal':sum(score)+1}
             if previous.get('id')==mid and previous.get('score')==score_text(score):
-                current.update({k:previous[k] for k in ('odds_1','odds_2','market_status','canvas_status','odds_source','odds_reason') if k in previous})
+                current.update({k:previous[k] for k in ('odds_1','odds_2','market_status','canvas_status','odds_source','odds_reason','odds_updated_at','odds_goal_number') if k in previous})
             self.runtime.current_match=current
             self.storage.set_match(mid,team_1=board.team1,team_2=board.team2)
             # 06:50 is the handover deadline: do not wait for 07:00 or for
@@ -204,12 +204,19 @@ class Collector:
             # Reading Canvas/search may take >5s. It must not block scoreboard
             # observations or the 06:50 handover.
             current_time=asyncio.get_running_loop().time()
-            retry_due=(odds_task is not None and odds_task.done() and current_time-last_odds_attempt>=12 and self.runtime.current_match.get('market_status')!='AVAILABLE')
-            if last_odds_score != score or retry_due:
+            # Odds vary during the SAME score. Refresh every 3 seconds when
+            # available; retry failed reads after 6 seconds. Never overlap
+            # Canvas reads on the same page.
+            market_state=self.runtime.current_match.get('market_status')
+            refresh_period=3.0 if market_state=='AVAILABLE' else 6.0
+            score_changed=last_odds_score != score
+            task_idle=odds_task is None or odds_task.done()
+            if score_changed and odds_task is not None and not odds_task.done():
+                odds_task.cancel()
+                task_idle=False
+            if task_idle and (score_changed or current_time-last_odds_attempt>=refresh_period):
                 last_odds_score=score
                 last_odds_attempt=current_time
-                if odds_task is not None and not odds_task.done():
-                    odds_task.cancel()
                 odds_task=asyncio.create_task(
                     self._read_odds_background(page,mid,score,board.team1,board.team2,read_odds)
                 )
@@ -267,7 +274,7 @@ class Collector:
             self.storage.odds(mid,score_text(score),None,None,'NOT_FOUND','CANVAS_2D','TIMEOUT_18S')
             current=self.runtime.current_match
             if current is not None and current.get('id')==mid and current.get('score')==score_text(score):
-                current.update(market_status='NOT_FOUND',canvas_status='Повторное чтение',odds_reason='TIMEOUT_18S')
+                current.update(market_status='NOT_FOUND',canvas_status='Повторное чтение',odds_reason='TIMEOUT_18S',odds_1=None,odds_2=None,odds_updated_at=None)
             self.log(f"Canvas: рынок ещё не готов при {score_text(score)}; повторим чтение без остановки наблюдения.")
         except Exception as exc:
             self.log(f"Ошибка фонового чтения Canvas: {type(exc).__name__}: {exc}")
@@ -283,12 +290,16 @@ class Collector:
                 self.runtime.current_match['odds_1']=float(odds.team1); self.runtime.current_match['odds_2']=float(odds.team2)
                 self.runtime.current_match['market_status']=status; self.runtime.current_match['canvas_status']='Активен'
                 self.runtime.current_match['odds_source']=getattr(odds,'source','CANVAS_2D')
+                self.runtime.current_match['odds_updated_at']=datetime.utcnow().isoformat()+'Z'
+                self.runtime.current_match['odds_goal_number']=sum(score)+1
+                self.runtime.current_match.pop('odds_reason',None)
             self.log(f'Коэффициенты сохранены: {t1}={odds.team1}; {t2}={odds.team2}.')
         except Exception as exc:
             reason=type(exc).__name__; self.storage.odds(mid,score_text(score),None,None,'NOT_FOUND','CANVAS_2D',reason)
             if self.runtime.current_match is not None and self.runtime.current_match.get('id')==mid and self.runtime.current_match.get('score')==score_text(score):
                 self.runtime.current_match['odds_1']=None; self.runtime.current_match['odds_2']=None
                 self.runtime.current_match['market_status']='NOT_FOUND'; self.runtime.current_match['canvas_status']='Ожидание/нет данных'; self.runtime.current_match['odds_reason']=reason
+                self.runtime.current_match['odds_updated_at']=None
             self.log(f'Рынок «Следующий гол» не прочитан: {reason}: {exc}')
     async def finished(self,page,period,selectors):
         if any(x in period.lower() for x in ('заверш','окончен','game over','finished')): return True
