@@ -101,9 +101,21 @@ class Storage:
 
     def all_goals(self):
         with self.connection() as con:
-            return [dict(r) for r in con.execute('''SELECT g.*, o.team_1_odds, o.team_2_odds
-              FROM goal_events g LEFT JOIN odds_snapshots o ON o.match_id=g.match_id AND o.score=g.score_before
-              ORDER BY g.match_id, g.goal_number''')]
+            return [dict(r) for r in con.execute('''SELECT g.*, (SELECT o.team_1_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_1_odds,
+              (SELECT o.team_2_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_2_odds
+              FROM goal_events g ORDER BY g.match_id, g.goal_number''')]
 
     def all_odds(self):
         with self.connection() as con:
@@ -114,8 +126,21 @@ class Storage:
         with self.connection() as con:
             matches=[dict(r) for r in con.execute('SELECT * FROM matches ORDER BY created_at DESC')]
             goals=[dict(r) for r in con.execute('''SELECT g.*,m.external_match_id,m.team_1,m.team_2,m.started_at,
-                o.team_1_odds,o.team_2_odds FROM goal_events g JOIN matches m ON m.id=g.match_id
-                LEFT JOIN odds_snapshots o ON o.match_id=g.match_id AND o.score=g.score_before
+                (SELECT o.team_1_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_1_odds,
+              (SELECT o.team_2_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_2_odds
+                FROM goal_events g JOIN matches m ON m.id=g.match_id
                 ORDER BY g.match_id,g.goal_number''')]
             odds=[dict(r) for r in con.execute('''SELECT o.*,m.external_match_id,m.team_1,m.team_2,m.started_at
                 FROM odds_snapshots o JOIN matches m ON m.id=o.match_id ORDER BY o.match_id,o.id''')]
@@ -130,7 +155,31 @@ class Storage:
         with self.connection() as con:
             match = con.execute("SELECT * FROM matches WHERE id=?", (match_id,)).fetchone()
             if not match: return None
-            return {"match":dict(match), "goals":[dict(x) for x in con.execute("SELECT * FROM goal_events WHERE match_id=? ORDER BY goal_number",(match_id,))], "odds":[dict(x) for x in con.execute("SELECT * FROM odds_snapshots WHERE match_id=? ORDER BY id",(match_id,))]}
+            return {"match":dict(match), "goals":[dict(x) for x in con.execute("""SELECT g.*, (SELECT o.team_1_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_1_odds,
+              (SELECT o.team_2_odds FROM odds_snapshots o
+               WHERE o.match_id=g.match_id AND o.score=g.score_before
+                 AND o.next_goal_number=g.goal_number
+                 AND o.market_status='AVAILABLE'
+                 AND o.team_1_odds IS NOT NULL AND o.team_2_odds IS NOT NULL
+                 AND o.captured_at<=g.detected_at
+               ORDER BY o.captured_at DESC,o.id DESC LIMIT 1) AS team_2_odds
+                FROM goal_events g WHERE g.match_id=? ORDER BY g.goal_number""",(match_id,))], "odds":[dict(x) for x in con.execute("SELECT * FROM odds_snapshots WHERE match_id=? ORDER BY id",(match_id,))]}
+
+
+    def clear_observations(self):
+        """Delete only Rush observations; preserve browser credentials and profile."""
+        with self.connection() as con:
+            counts = {table: con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for table in ("matches", "goal_events", "odds_snapshots", "match_events")}
+            for table in ("goal_events", "odds_snapshots", "match_events", "matches"):
+                con.execute(f"DELETE FROM {table}")
+            return counts
 
     def calculated_standings(self):
         """Derived standings from fully observed finished matches only.
